@@ -40,7 +40,7 @@ textarea{resize:vertical}
 .req{margin:0;font-weight:400;display:flex;align-items:center;gap:.3rem}
 .spacer{flex:1}
 button{font:inherit;cursor:pointer}
-.btn{border:1px solid var(--blue);background:var(--blue);color:#fff;border-radius:.35rem;padding:.45rem 1.1rem}
+.btn{border:1px solid var(--blue);background:var(--blue);color:#fff;border-radius:.35rem;padding:.45rem 1.1rem;text-decoration:none;display:inline-block}
 .btn.secondary{background:#fff;color:var(--blue)}
 .link{border:none;background:none;color:var(--blue);padding:0;font-size:.92rem}
 .link.danger{color:var(--red)}
@@ -83,16 +83,10 @@ function h(tag, attrs, ...children) {
   return el;
 }
 
-/* ---------- 首页 ---------- */
+/* ---------- 问卷表单（新建 / 编辑共用） ---------- */
 
-function renderHome() {
-  app.replaceChildren();
-
-  const listSection = h("section", null,
-    h("h2", null, "问卷列表"),
-    h("ul", {class: "plain", id: "survey-list"}, h("li", {class: "muted"}, "加载中…"))
-  );
-  const listEl = listSection.querySelector("#survey-list");
+function buildSurveyForm(existing, hooks) {
+  const mode = existing ? "edit" : "create";
 
   const banner = h("div", {class: "banner", id: "form-banner"});
   banner.hidden = true;
@@ -113,8 +107,9 @@ function renderHome() {
     });
   }
 
-  function optionRow() {
+  function optionRow(value) {
     const text = h("input", {type: "text", class: "opt-text", placeholder: "选项内容"});
+    if (value !== undefined && value !== null) text.value = value;
     const row = h("div", {class: "opt-row"},
       h("span", {class: "opt-index"}, "选项"),
       text,
@@ -123,7 +118,7 @@ function renderHome() {
     return row;
   }
 
-  function addQuestion(type) {
+  function addQuestion(type, prefill) {
     const isChoice = type === "single_choice";
     const options = h("div", {class: "options"});
     const card = h("div", {class: "card q-card", "data-type": type},
@@ -139,7 +134,9 @@ function renderHome() {
       h("p", {class: "field-err q-title-err"})
     );
     if (isChoice) {
-      options.append(optionRow(), optionRow());
+      const saved = prefill && Array.isArray(prefill.options) ? prefill.options : null;
+      if (saved && saved.length) saved.forEach(value => options.append(optionRow(value)));
+      else options.append(optionRow(), optionRow());
       card.append(
         options,
         h("p", {class: "field-err opt-err"}),
@@ -151,9 +148,14 @@ function renderHome() {
         options.querySelector(".opt-row:last-child .opt-text").focus();
       });
     }
+    if (prefill) {
+      card.querySelector(".q-title").value = prefill.title != null ? prefill.title : "";
+      card.querySelector(".q-required").checked = !!prefill.required;
+    }
     qBox.append(card);
     renumber();
-    card.querySelector(".q-title").focus();
+    if (!prefill) card.querySelector(".q-title").focus();
+    return card;
   }
 
   function clearErrors() {
@@ -172,26 +174,43 @@ function renderHome() {
     banner.scrollIntoView({behavior: "smooth", block: "nearest"});
   }
 
-  const form = h("form", {id: "draft-form", onsubmit: submitDraft},
+  const actionButtons = [
+    h("button", {type: "button", class: "btn secondary", onclick: () => addQuestion("text")}, "添加文本题"),
+    h("button", {type: "button", class: "btn secondary", onclick: () => addQuestion("single_choice")}, "添加单选题"),
+    h("span", {class: "spacer"})
+  ];
+  if (mode === "edit") {
+    // 离开编辑页即丢弃全部未保存的增删与输入
+    actionButtons.push(h("a", {class: "btn secondary", href: `#/surveys/${existing.id}`}, "取消"));
+  }
+  actionButtons.push(h("button", {type: "submit", class: "btn"},
+    mode === "edit" ? "保存修改" : "保存整份问卷"));
+
+  const form = h("form", {id: "draft-form", onsubmit: submitForm},
     banner,
     h("section", null,
-      h("h2", null, "新建问卷草稿"),
+      h("h2", null, mode === "edit" ? `编辑问卷草稿 #${existing.id}` : "新建问卷草稿"),
+      mode === "edit"
+        ? h("p", {class: "muted"}, "保存将整份替换当前草稿；取消则放弃本次修改，问卷编号和地址不变。")
+        : null,
       h("label", {for: "survey-title"}, "标题"),
       titleInput, titleErr,
       h("label", {for: "survey-desc"}, "说明"),
       descArea,
-      h("label", null, "题目（按下方顺序保存，至少一道题）"),
+      h("label", null, "题目（按下方顺序保存，至少保留一道题）"),
       qBox, qErr,
-      h("div", {class: "row-actions"},
-        h("button", {type: "button", class: "btn secondary", onclick: () => addQuestion("text")}, "添加文本题"),
-        h("button", {type: "button", class: "btn secondary", onclick: () => addQuestion("single_choice")}, "添加单选题"),
-        h("span", {class: "spacer"}),
-        h("button", {type: "submit", class: "btn"}, "保存整份问卷")
-      )
+      h("div", {class: "row-actions"}, actionButtons)
     )
   );
 
-  async function submitDraft(event) {
+  if (mode === "edit") {
+    titleInput.value = existing.title != null ? existing.title : "";
+    descArea.value = existing.description || "";
+    existing.questions.forEach(question => addQuestion(question.type, question));
+    renumber();
+  }
+
+  async function submitForm(event) {
     event.preventDefault();
     clearErrors();
     const problems = [];
@@ -205,8 +224,8 @@ function renderHome() {
 
     const cards = [...qBox.querySelectorAll(".q-card")];
     if (cards.length === 0) {
-      qErr.textContent = "新问卷至少需要一道题。";
-      problems.push({el: qBox, msg: "新问卷至少需要一道题，请先添加题目。"});
+      qErr.textContent = "问卷至少需要保留一道题。";
+      problems.push({el: qBox, msg: "问卷至少需要保留一道题，请先添加题目。"});
     }
 
     const payloadQuestions = [];
@@ -256,29 +275,48 @@ function renderHome() {
     }
 
     const payload = {title, description: descArea.value, questions: payloadQuestions};
+    const endpoint = mode === "edit" ? `/api/surveys/${existing.id}` : "/api/surveys";
     let resp;
     try {
-      resp = await fetch("/api/surveys", {
-        method: "POST",
+      resp = await fetch(endpoint, {
+        method: mode === "edit" ? "PUT" : "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload)
       });
     } catch (err) {
-      showBanner([{el: null, msg: `网络错误，问卷未保存：${err}`}]);
+      // 请求未成功：保留当前全部输入与增删结果
+      showBanner([{el: null, msg: `网络错误，问卷尚未保存：${err}`}]);
       return;
     }
     let data = {};
     try { data = await resp.json(); } catch (_) { /* 保留已输入内容 */ }
-    if (resp.status === 201 && data.id !== undefined) {
-      form.reset();
-      qBox.replaceChildren();
-      loadSurveys();
+    const saved = mode === "edit" ? resp.status === 200 : resp.status === 201;
+    if (saved && data.id !== undefined) {
+      if (mode === "create") {
+        form.reset();
+        qBox.replaceChildren();
+        if (hooks && hooks.onCreated) hooks.onCreated();
+      }
       location.hash = `#/surveys/${data.id}`;
       return;
     }
-    // 保存失败：不清空任何输入，展示服务端给出的具体问题
-    showBanner([{el: null, msg: data.error || `保存失败（HTTP ${resp.status}），请检查后重试。`}]);
+    // 服务端未确认保存成功：不清空任何输入，展示具体问题
+    showBanner([{el: null, msg: data.error || `保存失败（HTTP ${resp.status}），问卷未保存，请检查后重试。`}]);
   }
+
+  return form;
+}
+
+/* ---------- 首页 ---------- */
+
+function renderHome() {
+  app.replaceChildren();
+
+  const listSection = h("section", null,
+    h("h2", null, "问卷列表"),
+    h("ul", {class: "plain", id: "survey-list"}, h("li", {class: "muted"}, "加载中…"))
+  );
+  const listEl = listSection.querySelector("#survey-list");
 
   async function loadSurveys() {
     let data;
@@ -302,7 +340,7 @@ function renderHome() {
 
   app.append(
     listSection,
-    form
+    buildSurveyForm(null, {onCreated: loadSurveys})
   );
   loadSurveys();
 }
@@ -323,15 +361,23 @@ async function renderDetail(id) {
       status.textContent = `问卷 #${id} 不存在。`;
       return;
     }
+    if (!resp.ok) {
+      status.textContent = `详情加载失败（HTTP ${resp.status}），请稍后重试。`;
+      return;
+    }
     survey = await resp.json();
   } catch (err) {
     status.textContent = `详情加载失败：${err}`;
     return;
   }
 
-  app.replaceChildren(h("p", null, h("a", {href: "#/"}, "← 返回首页")));
-  app.append(
+  app.replaceChildren(
+    h("p", null, h("a", {href: "#/"}, "← 返回首页")),
     h("h2", null, `#${survey.id} ${survey.title}`),
+    h("div", {class: "row-actions"},
+      h("a", {class: "btn", href: `#/surveys/${survey.id}/edit`}, "编辑草稿"),
+      h("a", {class: "btn secondary", href: "#/"}, "返回首页")
+    ),
     h("h3", null, "说明"),
     survey.description
       ? h("p", {class: "detail-desc"}, survey.description)
@@ -339,7 +385,10 @@ async function renderDetail(id) {
     h("h3", null, `题目（共 ${survey.questions.length} 道）`)
   );
   if (!survey.questions.length) {
-    app.append(h("p", {class: "muted"}, "该问卷草稿还没有题目。"));
+    app.append(
+      h("p", {class: "muted"}, "该问卷草稿还没有题目，可进入编辑补齐。"),
+      h("p", null, h("a", {class: "btn", href: `#/surveys/${survey.id}/edit`}, "编辑草稿并添加题目"))
+    );
     return;
   }
   app.append(h("ol", {class: "q-list"},
@@ -357,9 +406,57 @@ async function renderDetail(id) {
   );
 }
 
+/* ---------- 编辑草稿 ---------- */
+
+function showEditLoadError(id, message) {
+  // 加载失败时明确提示，绝不能用空白编辑表单覆盖已有内容
+  app.replaceChildren(
+    h("p", null, h("a", {href: "#/"}, "← 返回首页")),
+    h("h2", null, `编辑问卷草稿 #${id}`),
+    h("div", {class: "banner", role: "alert"},
+      h("strong", null, "问卷内容加载失败，未打开编辑表单："),
+      h("p", {class: "detail-meta", style: "margin:.4rem 0 0"}, message),
+      h("p", {style: "margin:.6rem 0 0"},
+        h("button", {type: "button", class: "btn secondary", onclick: () => renderEdit(id)}, "重试"), " ",
+        h("a", {class: "btn secondary", href: `#/surveys/${id}`}, "返回详情"))
+    )
+  );
+}
+
+async function renderEdit(id) {
+  app.replaceChildren(
+    h("p", null, h("a", {href: `#/surveys/${id}`}, "← 返回问卷详情")),
+    h("p", {class: "muted", id: "edit-status"}, "加载中…")
+  );
+
+  let survey;
+  try {
+    const resp = await fetch(`/api/surveys/${id}`);
+    if (resp.status === 404) {
+      showEditLoadError(id, `问卷 #${id} 不存在。`);
+      return;
+    }
+    if (!resp.ok) {
+      showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`);
+      return;
+    }
+    survey = await resp.json();
+  } catch (err) {
+    showEditLoadError(id, `网络错误：${err}。已保存的问卷内容未受影响，可重试加载。`);
+    return;
+  }
+
+  app.replaceChildren(
+    h("p", null, h("a", {href: `#/surveys/${id}`}, "← 返回问卷详情")),
+    buildSurveyForm(survey, {})
+  );
+}
+
 function route() {
-  const match = location.hash.match(/^#\/surveys\/(\d+)$/);
-  if (match) renderDetail(Number(match[1]));
+  const editMatch = location.hash.match(/^#\/surveys\/(\d+)\/edit$/);
+  const detailMatch = location.hash.match(/^#\/surveys\/(\d+)$/);
+  if (editMatch) renderEdit(Number(editMatch[1]));
+  else if (detailMatch) renderDetail(Number(detailMatch[1]));
   else renderHome();
 }
 window.addEventListener("hashchange", route);
@@ -531,21 +628,55 @@ def main():
                 (clean["title"], clean["description"]),
             )
             survey_id = cursor.lastrowid
-            for position, question in enumerate(clean["questions"]):
-                question_cursor = database.execute(
-                    "INSERT INTO questions (survey_id, position, type, title, required) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (survey_id, position, question["type"], question["title"],
-                     1 if question["required"] else 0),
-                )
-                question_id = question_cursor.lastrowid
-                for option_position, option in enumerate(question["options"]):
-                    database.execute(
-                        "INSERT INTO question_options (question_id, position, text) VALUES (?, ?, ?)",
-                        (question_id, option_position, option),
-                    )
+            write_questions(survey_id, clean["questions"])
             database.commit()
             return survey_id
+        except Exception:
+            database.rollback()
+            raise
+
+    def write_questions(survey_id, questions):
+        """Replace all questions/options of a survey with the given ordered list."""
+        old_question_ids = [row[0] for row in database.execute(
+            "SELECT id FROM questions WHERE survey_id = ?", (survey_id,)
+        )]
+        if old_question_ids:
+            placeholders = ",".join("?" for _ in old_question_ids)
+            database.execute(
+                f"DELETE FROM question_options WHERE question_id IN ({placeholders})",
+                old_question_ids,
+            )
+        database.execute("DELETE FROM questions WHERE survey_id = ?", (survey_id,))
+        for position, question in enumerate(questions):
+            question_cursor = database.execute(
+                "INSERT INTO questions (survey_id, position, type, title, required) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (survey_id, position, question["type"], question["title"],
+                 1 if question["required"] else 0),
+            )
+            question_id = question_cursor.lastrowid
+            for option_position, option in enumerate(question["options"]):
+                database.execute(
+                    "INSERT INTO question_options (question_id, position, text) VALUES (?, ?, ?)",
+                    (question_id, option_position, option),
+                )
+
+    def replace_survey(survey_id, clean):
+        """Replace a whole survey atomically; keeps the same id.
+
+        Returns False when the survey does not exist (no record is created).
+        """
+        row = database.execute("SELECT 1 FROM surveys WHERE id = ?", (survey_id,)).fetchone()
+        if row is None:
+            return False
+        try:
+            database.execute(
+                "UPDATE surveys SET title = ?, description = ? WHERE id = ?",
+                (clean["title"], clean["description"], survey_id),
+            )
+            write_questions(survey_id, clean["questions"])
+            database.commit()
+            return True
         except Exception:
             database.rollback()
             raise
@@ -568,22 +699,29 @@ def main():
             ]
             self.respond(200, {RESOURCE: records})
 
-        def create_survey(self):
+        def read_payload(self):
+            """Read and decode a JSON request body.
+
+            Returns (payload, None) or (None, error_message).
+            """
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = -1
             if length < 0:
-                self.respond(400, {"error": "Content-Length 无效"})
-                return
+                return None, "Content-Length 无效"
             if length > MAX_BODY_BYTES:
-                self.respond(400, {"error": "请求体过大"})
-                return
+                return None, "请求体过大"
             body = self.rfile.read(length) if length else b""
             try:
-                payload = json.loads(body.decode("utf8"))
+                return json.loads(body.decode("utf8")), None
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                self.respond(400, {"error": f"请求体不是合法 JSON：{error}"})
+                return None, f"请求体不是合法 JSON：{error}"
+
+        def create_survey(self):
+            payload, error = self.read_payload()
+            if error is not None:
+                self.respond(400, {"error": error})
                 return
 
             clean, error = validate_survey(payload)
@@ -598,6 +736,29 @@ def main():
             result = {"id": survey_id, **clean}
             self.respond(201, result)
 
+        def update_survey(self, survey_id):
+            payload, read_error = self.read_payload()
+            if survey_detail(survey_id) is None:
+                # Editing a missing id is always 404 and must never create one.
+                self.respond(404, {"error": "not found"})
+                return
+            if read_error is not None:
+                self.respond(400, {"error": read_error})
+                return
+
+            # Full replacement: validate before touching the stored draft so a
+            # rejected request leaves the old survey exactly as it was.
+            clean, error = validate_survey(payload)
+            if error is not None:
+                self.respond(400, {"error": error})
+                return
+            try:
+                replace_survey(survey_id, clean)
+            except sqlite3.DatabaseError as error:
+                self.respond(500, {"error": f"保存失败：{error}"})
+                return
+            self.respond(200, {"id": survey_id, **clean})
+
         def route(self):
             location = urlsplit(self.path).path
             detail_match = re.fullmatch(r"/api/surveys/(\d+)", location)
@@ -607,7 +768,7 @@ def main():
             elif location in ("/", "/health"):
                 allowed = ["GET"]
             elif detail_match:
-                allowed = ["GET"]
+                allowed = ["GET", "PUT"]
             else:
                 self.respond(404, {"error": "not found"})
                 return
@@ -626,7 +787,11 @@ def main():
                 else:
                     self.list_surveys()
             else:
-                detail = survey_detail(int(detail_match.group(1)))
+                survey_id = int(detail_match.group(1))
+                if self.command == "PUT":
+                    self.update_survey(survey_id)
+                    return
+                detail = survey_detail(survey_id)
                 if detail is None:
                     self.respond(404, {"error": "not found"})
                 else:
