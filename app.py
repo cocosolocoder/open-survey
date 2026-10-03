@@ -90,7 +90,7 @@ function h(tag, attrs, ...children) {
 
 /* ---------- 问卷表单（新建 / 编辑共用） ---------- */
 
-function buildSurveyForm(existing, hooks) {
+function buildSurveyForm(existing, hooks, view) {
   const mode = existing ? "edit" : "create";
 
   const banner = h("div", {class: "banner", id: "form-banner"});
@@ -281,6 +281,10 @@ function buildSurveyForm(existing, hooks) {
 
     const payload = {title, description: descArea.value, questions: payloadQuestions};
     const endpoint = mode === "edit" ? `/api/surveys/${existing.id}` : "/api/surveys";
+    // 这次保存只属于发起它的那一代表单；响应再晚返回，只要用户已经离开
+    // （首页/详情/编辑切换、重新进入同一问卷、浏览器前进后退），其成功或
+    // 失败结果都必须静默丢弃，不能跳转、清空或提示到当前页面上。
+    const submitView = view;
     let resp;
     try {
       resp = await fetch(endpoint, {
@@ -289,12 +293,15 @@ function buildSurveyForm(existing, hooks) {
         body: JSON.stringify(payload)
       });
     } catch (err) {
+      if (submitView !== activeView) return;
       // 请求未成功：保留当前全部输入与增删结果
       showBanner([{el: null, msg: `网络错误，问卷尚未保存：${err}`}]);
       return;
     }
+    if (submitView !== activeView) return;
     let data = {};
     try { data = await resp.json(); } catch (_) { /* 保留已输入内容 */ }
+    if (submitView !== activeView) return;
     const saved = mode === "edit" ? resp.status === 200 : resp.status === 201;
     if (saved && data.id !== undefined) {
       if (mode === "create") {
@@ -348,7 +355,7 @@ function renderHome() {
 
   app.append(
     listSection,
-    buildSurveyForm(null, {onCreated: loadSurveys})
+    buildSurveyForm(null, {onCreated: loadSurveys}, view)
   );
   loadSurveys();
 }
@@ -464,7 +471,7 @@ async function renderEdit(id) {
   if (view !== activeView) return;
   app.replaceChildren(
     h("p", null, h("a", {href: `#/surveys/${id}`}, "← 返回问卷详情")),
-    buildSurveyForm(survey, {})
+    buildSurveyForm(survey, {}, view)
   );
 }
 
