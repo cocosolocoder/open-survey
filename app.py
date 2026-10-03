@@ -68,6 +68,11 @@ button{font:inherit;cursor:pointer}
 "use strict";
 const app = document.getElementById("app");
 
+// 每次进入一个页面都开启新一代视图：切换首页/详情/编辑、重新进入同一份问卷、
+// 重试加载以及浏览器前进/后退都会使代数递增。较早一代页面发起的请求再晚
+// 返回也必须丢弃，不能覆盖用户当前所在页面。
+let activeView = 0;
+
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
   if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -310,6 +315,7 @@ function buildSurveyForm(existing, hooks) {
 /* ---------- 首页 ---------- */
 
 function renderHome() {
+  const view = ++activeView;
   app.replaceChildren();
 
   const listSection = h("section", null,
@@ -324,9 +330,11 @@ function renderHome() {
       const resp = await fetch("/api/surveys");
       data = await resp.json();
     } catch (err) {
+      if (view !== activeView) return;
       listEl.replaceChildren(h("li", {class: "muted"}, "问卷列表加载失败。"));
       return;
     }
+    if (view !== activeView) return;
     listEl.replaceChildren();
     if (!data.surveys.length) {
       listEl.append(h("li", {class: "muted"}, "还没有问卷记录。"));
@@ -348,6 +356,7 @@ function renderHome() {
 /* ---------- 问卷详情 ---------- */
 
 async function renderDetail(id) {
+  const view = ++activeView;
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
     h("p", {class: "muted", id: "detail-status"}, "加载中…")
@@ -357,6 +366,7 @@ async function renderDetail(id) {
   let survey;
   try {
     const resp = await fetch(`/api/surveys/${id}`);
+    if (view !== activeView) return;
     if (resp.status === 404) {
       status.textContent = `问卷 #${id} 不存在。`;
       return;
@@ -367,9 +377,11 @@ async function renderDetail(id) {
     }
     survey = await resp.json();
   } catch (err) {
+    if (view !== activeView) return;
     status.textContent = `详情加载失败：${err}`;
     return;
   }
+  if (view !== activeView) return;
 
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
@@ -408,8 +420,9 @@ async function renderDetail(id) {
 
 /* ---------- 编辑草稿 ---------- */
 
-function showEditLoadError(id, message) {
+function showEditLoadError(id, message, view) {
   // 加载失败时明确提示，绝不能用空白编辑表单覆盖已有内容
+  if (view !== activeView) return;
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
     h("h2", null, `编辑问卷草稿 #${id}`),
@@ -424,6 +437,7 @@ function showEditLoadError(id, message) {
 }
 
 async function renderEdit(id) {
+  const view = ++activeView;
   app.replaceChildren(
     h("p", null, h("a", {href: `#/surveys/${id}`}, "← 返回问卷详情")),
     h("p", {class: "muted", id: "edit-status"}, "加载中…")
@@ -432,20 +446,22 @@ async function renderEdit(id) {
   let survey;
   try {
     const resp = await fetch(`/api/surveys/${id}`);
+    if (view !== activeView) return;
     if (resp.status === 404) {
-      showEditLoadError(id, `问卷 #${id} 不存在。`);
+      showEditLoadError(id, `问卷 #${id} 不存在。`, view);
       return;
     }
     if (!resp.ok) {
-      showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`);
+      showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`, view);
       return;
     }
     survey = await resp.json();
   } catch (err) {
-    showEditLoadError(id, `网络错误：${err}。已保存的问卷内容未受影响，可重试加载。`);
+    showEditLoadError(id, `网络错误：${err}。已保存的问卷内容未受影响，可重试加载。`, view);
     return;
   }
 
+  if (view !== activeView) return;
   app.replaceChildren(
     h("p", null, h("a", {href: `#/surveys/${id}`}, "← 返回问卷详情")),
     buildSurveyForm(survey, {})
