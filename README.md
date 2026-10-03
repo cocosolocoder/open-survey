@@ -37,6 +37,17 @@ python3 app.py serve --host 127.0.0.1 --port 8080 --data-dir data
 
 数据保存在 `--data-dir` 下的 SQLite 中，使用同一目录重启后记录、题目与选项仍可读取。
 
+自动化回归保障：
+
+```sh
+# 接口级：整份替换（PUT /api/surveys/{id}）的保存结果，仅依赖标准库
+python3 -m unittest test_survey_replace -v
+
+# 页面级：编辑页「保存修改」的时序保护（离开后旧保存结果不得影响当前页面），
+# 需要 pip install playwright 与可用的 Chrome/Chromium
+python3 -m unittest test_survey_save_page -v
+```
+
 ```sh
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/api/surveys
