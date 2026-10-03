@@ -68,6 +68,10 @@ button{font:inherit;cursor:pointer}
 "use strict";
 const app = document.getElementById("app");
 
+// 每次路由切换（含前进/后退、同问卷重新进入）递增代次；
+// 异步加载返回后只有代次仍匹配时才允许写入页面，避免旧结果覆盖当前页。
+let routeEpoch = 0;
+
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
   if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -347,7 +351,7 @@ function renderHome() {
 
 /* ---------- 问卷详情 ---------- */
 
-async function renderDetail(id) {
+async function renderDetail(id, epoch) {
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
     h("p", {class: "muted", id: "detail-status"}, "加载中…")
@@ -357,6 +361,7 @@ async function renderDetail(id) {
   let survey;
   try {
     const resp = await fetch(`/api/surveys/${id}`);
+    if (epoch !== routeEpoch) return;
     if (resp.status === 404) {
       status.textContent = `问卷 #${id} 不存在。`;
       return;
@@ -366,7 +371,9 @@ async function renderDetail(id) {
       return;
     }
     survey = await resp.json();
+    if (epoch !== routeEpoch) return;
   } catch (err) {
+    if (epoch !== routeEpoch) return;
     status.textContent = `详情加载失败：${err}`;
     return;
   }
@@ -408,7 +415,7 @@ async function renderDetail(id) {
 
 /* ---------- 编辑草稿 ---------- */
 
-function showEditLoadError(id, message) {
+function showEditLoadError(id, message, epoch) {
   // 加载失败时明确提示，绝不能用空白编辑表单覆盖已有内容
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
@@ -417,13 +424,13 @@ function showEditLoadError(id, message) {
       h("strong", null, "问卷内容加载失败，未打开编辑表单："),
       h("p", {class: "detail-meta", style: "margin:.4rem 0 0"}, message),
       h("p", {style: "margin:.6rem 0 0"},
-        h("button", {type: "button", class: "btn secondary", onclick: () => renderEdit(id)}, "重试"), " ",
+        h("button", {type: "button", class: "btn secondary", onclick: () => renderEdit(id, epoch)}, "重试"), " ",
         h("a", {class: "btn secondary", href: `#/surveys/${id}`}, "返回详情"))
     )
   );
 }
 
-async function renderEdit(id) {
+async function renderEdit(id, epoch) {
   app.replaceChildren(
     h("p", null, h("a", {href: `#/surveys/${id}`}, "← 返回问卷详情")),
     h("p", {class: "muted", id: "edit-status"}, "加载中…")
@@ -432,17 +439,20 @@ async function renderEdit(id) {
   let survey;
   try {
     const resp = await fetch(`/api/surveys/${id}`);
+    if (epoch !== routeEpoch) return;
     if (resp.status === 404) {
-      showEditLoadError(id, `问卷 #${id} 不存在。`);
+      showEditLoadError(id, `问卷 #${id} 不存在。`, epoch);
       return;
     }
     if (!resp.ok) {
-      showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`);
+      showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`, epoch);
       return;
     }
     survey = await resp.json();
+    if (epoch !== routeEpoch) return;
   } catch (err) {
-    showEditLoadError(id, `网络错误：${err}。已保存的问卷内容未受影响，可重试加载。`);
+    if (epoch !== routeEpoch) return;
+    showEditLoadError(id, `网络错误：${err}。已保存的问卷内容未受影响，可重试加载。`, epoch);
     return;
   }
 
@@ -453,10 +463,12 @@ async function renderEdit(id) {
 }
 
 function route() {
+  routeEpoch += 1;
+  const epoch = routeEpoch;
   const editMatch = location.hash.match(/^#\/surveys\/(\d+)\/edit$/);
   const detailMatch = location.hash.match(/^#\/surveys\/(\d+)$/);
-  if (editMatch) renderEdit(Number(editMatch[1]));
-  else if (detailMatch) renderDetail(Number(detailMatch[1]));
+  if (editMatch) renderEdit(Number(editMatch[1]), epoch);
+  else if (detailMatch) renderDetail(Number(detailMatch[1]), epoch);
   else renderHome();
 }
 window.addEventListener("hashchange", route);
