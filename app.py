@@ -281,6 +281,11 @@ function buildSurveyForm(existing, hooks) {
 
     const payload = {title, description: descArea.value, questions: payloadQuestions};
     const endpoint = mode === "edit" ? `/api/surveys/${existing.id}` : "/api/surveys";
+    // 本次提交绑定提交时的视图代数：响应返回时若用户已离开这个表单
+    // （返回首页、打开其他问卷、取消编辑、重新进入同一问卷或前进/后退），
+    // 一律丢弃结果——不跳转、不清空当前表单、不在新页面显示旧表单的提示。
+    // 已发出的请求不撤销；若服务端已保存，之后正常打开该问卷即可看到。
+    const view = activeView;
     let resp;
     try {
       resp = await fetch(endpoint, {
@@ -289,10 +294,12 @@ function buildSurveyForm(existing, hooks) {
         body: JSON.stringify(payload)
       });
     } catch (err) {
+      if (view !== activeView) return;
       // 请求未成功：保留当前全部输入与增删结果
       showBanner([{el: null, msg: `网络错误，问卷尚未保存：${err}`}]);
       return;
     }
+    if (view !== activeView) return;
     let data = {};
     try { data = await resp.json(); } catch (_) { /* 保留已输入内容 */ }
     const saved = mode === "edit" ? resp.status === 200 : resp.status === 201;
