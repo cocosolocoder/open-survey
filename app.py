@@ -30,8 +30,10 @@ h2{margin-top:2.2rem;border-bottom:1px solid var(--line);padding-bottom:.3rem}
 ul.plain{list-style:none;padding-left:0}
 ul.plain li{padding:.25rem 0;border-bottom:1px dashed var(--line)}
 form label{display:block;margin:1rem 0 .25rem;font-weight:600}
-input[type=text],textarea,input.opt-text,input.q-title{width:100%;padding:.5rem .6rem;border:1px solid var(--line);border-radius:.35rem;font:inherit}
+input[type=text],textarea{width:100%;padding:.5rem .6rem;border:1px solid var(--line);border-radius:.35rem;font:inherit}
 textarea{resize:vertical}
+/* 标题与选项允许内部换行：用随内容增高的 textarea 展示，不能压成单行输入框 */
+textarea.grow{resize:none;overflow:hidden;min-height:2.4rem;line-height:1.5}
 .card{border:1px solid var(--line);border-radius:.5rem;padding:1rem 1.2rem;margin:1rem 0;background:#fafbfd}
 .q-head{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;margin-bottom:.5rem}
 .q-index{font-weight:700}
@@ -54,6 +56,8 @@ button{font:inherit;cursor:pointer}
 .invalid{border-color:var(--red)!important;background:#fdf6f5}
 .detail-meta{color:var(--grey);font-size:.9rem}
 .detail-desc,.opt-text-display{white-space:pre-wrap}
+/* 标题中被接口保留的内部换行在列表与详情中也要原样显示 */
+h2,.q-list .q-line,ul.plain a{white-space:pre-wrap}
 .q-list>li{margin:1rem 0}
 .q-list .q-line{font-weight:600}
 .q-list ol{margin:.4rem 0 0 1.4rem}
@@ -96,7 +100,8 @@ function buildSurveyForm(existing, hooks, view) {
   const banner = h("div", {class: "banner", id: "form-banner"});
   banner.hidden = true;
 
-  const titleInput = h("input", {type: "text", id: "survey-title", maxlength: "200", placeholder: "请输入问卷标题"});
+  const titleInput = h("textarea", {id: "survey-title", rows: "1", class: "grow",
+    maxlength: "200", placeholder: "请输入问卷标题（可含换行）"});
   const titleErr = h("p", {class: "field-err", id: "title-err"});
   const descArea = h("textarea", {id: "survey-desc", rows: "4", placeholder: "问卷说明（可留空，支持中文、引号与换行）"});
   const qBox = h("div", {id: "questions"});
@@ -112,9 +117,19 @@ function buildSurveyForm(existing, hooks, view) {
     });
   }
 
+  // textarea 的高度随内容变化：单行内容外观与原输入框一致，出现内部换行时
+  // 自动增高，让换行真实可见、可编辑，而不是被折叠或截断。
+  function autoGrow(el) {
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }
+  // 预填值时元素可能还没挂到文档上（scrollHeight 为 0），延到下一帧布局后再量。
+  function scheduleGrow(el) { requestAnimationFrame(() => autoGrow(el)); }
+
   function optionRow(value) {
-    const text = h("input", {type: "text", class: "opt-text", placeholder: "选项内容"});
-    if (value !== undefined && value !== null) text.value = value;
+    const text = h("textarea", {rows: "1", class: "opt-text grow", placeholder: "选项内容（可含换行）"});
+    text.addEventListener("input", () => autoGrow(text));
+    if (value !== undefined && value !== null) { text.value = value; scheduleGrow(text); }
     const row = h("div", {class: "opt-row"},
       h("span", {class: "opt-index"}, "选项"),
       text,
@@ -135,7 +150,7 @@ function buildSurveyForm(existing, hooks, view) {
         h("span", {class: "spacer"}),
         h("button", {type: "button", class: "link danger", onclick: () => { card.remove(); renumber(); }}, "删除本题")
       ),
-      h("input", {type: "text", class: "q-title", placeholder: "题目标题"}),
+      h("textarea", {rows: "1", class: "q-title grow", placeholder: "题目标题（可含换行）"}),
       h("p", {class: "field-err q-title-err"})
     );
     if (isChoice) {
@@ -153,13 +168,16 @@ function buildSurveyForm(existing, hooks, view) {
         options.querySelector(".opt-row:last-child .opt-text").focus();
       });
     }
+    const qTitleEl = card.querySelector(".q-title");
+    qTitleEl.addEventListener("input", () => autoGrow(qTitleEl));
     if (prefill) {
-      card.querySelector(".q-title").value = prefill.title != null ? prefill.title : "";
+      qTitleEl.value = prefill.title != null ? prefill.title : "";
       card.querySelector(".q-required").checked = !!prefill.required;
     }
+    scheduleGrow(qTitleEl);
     qBox.append(card);
     renumber();
-    if (!prefill) card.querySelector(".q-title").focus();
+    if (!prefill) qTitleEl.focus();
     return card;
   }
 
@@ -208,11 +226,13 @@ function buildSurveyForm(existing, hooks, view) {
     )
   );
 
+  titleInput.addEventListener("input", () => autoGrow(titleInput));
   if (mode === "edit") {
     titleInput.value = existing.title != null ? existing.title : "";
     descArea.value = existing.description || "";
     existing.questions.forEach(question => addQuestion(question.type, question));
     renumber();
+    scheduleGrow(titleInput);
   }
 
   async function submitForm(event) {
@@ -307,6 +327,7 @@ function buildSurveyForm(existing, hooks, view) {
       if (mode === "create") {
         form.reset();
         qBox.replaceChildren();
+        autoGrow(titleInput);
         if (hooks && hooks.onCreated) hooks.onCreated();
       }
       location.hash = `#/surveys/${data.id}`;
