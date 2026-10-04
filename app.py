@@ -30,7 +30,7 @@ h2{margin-top:2.2rem;border-bottom:1px solid var(--line);padding-bottom:.3rem}
 ul.plain{list-style:none;padding-left:0}
 ul.plain li{padding:.25rem 0;border-bottom:1px dashed var(--line)}
 form label{display:block;margin:1rem 0 .25rem;font-weight:600}
-input[type=text],textarea,input.opt-text,input.q-title{width:100%;padding:.5rem .6rem;border:1px solid var(--line);border-radius:.35rem;font:inherit}
+input[type=text],textarea{width:100%;padding:.5rem .6rem;border:1px solid var(--line);border-radius:.35rem;font:inherit}
 textarea{resize:vertical}
 .card{border:1px solid var(--line);border-radius:.5rem;padding:1rem 1.2rem;margin:1rem 0;background:#fafbfd}
 .q-head{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;margin-bottom:.5rem}
@@ -53,9 +53,9 @@ button{font:inherit;cursor:pointer}
 .field-err{color:var(--red);font-size:.85rem;margin:.25rem 0 0;min-height:1px}
 .invalid{border-color:var(--red)!important;background:#fdf6f5}
 .detail-meta{color:var(--grey);font-size:.9rem}
-.detail-desc,.opt-text-display{white-space:pre-wrap}
+.detail-desc,.opt-text-display,.detail-title{white-space:pre-wrap}
 .q-list>li{margin:1rem 0}
-.q-list .q-line{font-weight:600}
+.q-list .q-line{font-weight:600;white-space:pre-wrap}
 .q-list ol{margin:.4rem 0 0 1.4rem}
 </style>
 <main>
@@ -96,7 +96,9 @@ function buildSurveyForm(existing, hooks, view) {
   const banner = h("div", {class: "banner", id: "form-banner"});
   banner.hidden = true;
 
-  const titleInput = h("input", {type: "text", id: "survey-title", maxlength: "200", placeholder: "请输入问卷标题"});
+  // 标题、题目标题与选项都可能含有接口已接受的内部换行，单行 input 会把
+  // 换行吞掉并在保存时改写原文，因此一律用 textarea 承载，逐字保留内容。
+  const titleInput = h("textarea", {id: "survey-title", rows: "2", maxlength: "200", placeholder: "请输入问卷标题"});
   const titleErr = h("p", {class: "field-err", id: "title-err"});
   const descArea = h("textarea", {id: "survey-desc", rows: "4", placeholder: "问卷说明（可留空，支持中文、引号与换行）"});
   const qBox = h("div", {id: "questions"});
@@ -113,7 +115,7 @@ function buildSurveyForm(existing, hooks, view) {
   }
 
   function optionRow(value) {
-    const text = h("input", {type: "text", class: "opt-text", placeholder: "选项内容"});
+    const text = h("textarea", {class: "opt-text", rows: "2", placeholder: "选项内容"});
     if (value !== undefined && value !== null) text.value = value;
     const row = h("div", {class: "opt-row"},
       h("span", {class: "opt-index"}, "选项"),
@@ -135,7 +137,7 @@ function buildSurveyForm(existing, hooks, view) {
         h("span", {class: "spacer"}),
         h("button", {type: "button", class: "link danger", onclick: () => { card.remove(); renumber(); }}, "删除本题")
       ),
-      h("input", {type: "text", class: "q-title", placeholder: "题目标题"}),
+      h("textarea", {class: "q-title", rows: "2", placeholder: "题目标题"}),
       h("p", {class: "field-err q-title-err"})
     );
     if (isChoice) {
@@ -392,7 +394,7 @@ async function renderDetail(id) {
 
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
-    h("h2", null, `#${survey.id} ${survey.title}`),
+    h("h2", {class: "detail-title"}, `#${survey.id} ${survey.title}`),
     h("div", {class: "row-actions"},
       h("a", {class: "btn", href: `#/surveys/${survey.id}/edit`}, "编辑草稿"),
       h("a", {class: "btn secondary", href: "#/"}, "返回首页")
