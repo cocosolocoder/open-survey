@@ -59,6 +59,8 @@ button{font:inherit;cursor:pointer}
 .save-note{border-radius:.5rem;padding:.7rem 1rem;white-space:normal}
 .save-note.saved{border:1px solid #1e7e45;background:#ecf7f0;color:#155c33}
 .save-note.dirty{border:1px solid #9a6d12;background:#fdf6e3;color:#7a5207}
+.save-note.saving{border:1px solid var(--blue);background:#eef4fb;color:var(--blue)}
+button:disabled{opacity:.6;cursor:default}
 .field-err{color:var(--red);font-size:.85rem;margin:.25rem 0 0;min-height:1px}
 .invalid{border-color:var(--red)!important;background:#fdf6f5}
 .detail-meta{color:var(--grey);font-size:.9rem}
@@ -222,6 +224,17 @@ function buildSurveyForm(existing, hooks, view) {
     statusBar.hidden = false;
   }
 
+  // 等待状态条：本次保存已发出、还没有明确结果时明确显示“正在保存”。
+  // 它与成功/未保存提示共用状态条，但同一时刻只显示其中一种。
+  function renderSaving() {
+    statusBar.replaceChildren(
+      h("div", {class: "save-note saving", id: "save-note-saving"},
+        h("strong", null, "正在保存：本次提交已发出，正在等待服务器响应。"),
+        "等待期间可以继续修改标题、说明、题目与选项；这些修改不会并入本次请求，再次点击保存才会提交。")
+    );
+    statusBar.hidden = false;
+  }
+
   // 按与提交时完全相同的规则读取当前表单：标题/题目标题/选项去掉首尾空白，
   // 说明与内部换行原样保留。返回结构可直接做整体相等比较，用来判断“点击保存
   // 之后表单是否又被改过”。改过又恢复原值时结构相同，不会被当成有未保存修改。
@@ -256,8 +269,22 @@ function buildSurveyForm(existing, hooks, view) {
     // 离开编辑页即丢弃全部未保存的增删与输入
     actionButtons.push(h("a", {class: "btn secondary", href: `#/surveys/${existing.id}`}, "取消"));
   }
-  actionButtons.push(h("button", {type: "submit", class: "btn"},
-    mode === "edit" ? "保存修改" : "保存整份问卷"));
+  const submitButton = h("button", {type: "submit", class: "btn"},
+    mode === "edit" ? "保存修改" : "保存整份问卷");
+  const submitLabel = submitButton.textContent;
+  actionButtons.push(submitButton);
+
+  // 同一表单同一时刻只允许一次保存在等待结果。标志属于这个表单实例：
+  // 用户离开后表单被整体丢弃，重新进入编辑页是全新实例，保存自然恢复可用。
+  let saving = false;
+  function setSaving(on) {
+    saving = on;
+    // 禁用提交按钮同时挡住鼠标点击与键盘（回车）触发的隐式提交；
+    // submitForm 入口处的 saving 检查再兜住 requestSubmit 等程序化触发。
+    submitButton.disabled = on;
+    submitButton.textContent = on ? "保存中…" : submitLabel;
+    if (on) renderSaving();
+  }
 
   const form = h("form", {id: "draft-form", onsubmit: submitForm},
     banner,
@@ -320,6 +347,9 @@ function buildSurveyForm(existing, hooks, view) {
 
   async function submitForm(event) {
     event.preventDefault();
+    // 上一次保存还没有明确结果：重复点击或键盘重复触发一律忽略——既不追加
+    // 请求，也不清除正在显示的等待状态（此处必须早于任何清状态的操作）。
+    if (saving) return;
     clearErrors();
     hideSaveStatus();
     const problems = [];
@@ -398,6 +428,9 @@ function buildSurveyForm(existing, hooks, view) {
     // （首页/详情/编辑切换、重新进入同一问卷、浏览器前进后退），其成功或
     // 失败结果都必须静默丢弃，不能跳转、清空或提示到当前页面上。
     const submitView = view;
+    // 进入等待状态：禁用保存入口并显示“正在保存”，直到本次请求有明确结果。
+    // 校验未通过时不会走到这里，因此不会留下没有请求对应的等待状态。
+    setSaving(true);
     let resp;
     try {
       resp = await fetch(endpoint, {
@@ -406,17 +439,21 @@ function buildSurveyForm(existing, hooks, view) {
         body: JSON.stringify(payload)
       });
     } catch (err) {
+      // 网络错误：结束等待、恢复保存入口，保留当前全部输入与增删结果；
+      // 不自动重发，由用户修改后再次保存。
+      setSaving(false);
+      hideSaveStatus();
       if (submitView !== activeView) return;
-      // 请求未成功：保留当前全部输入与增删结果
       showBanner([{el: null, msg: `网络错误，问卷尚未保存：${err}`}]);
       return;
     }
-    if (submitView !== activeView) return;
+    if (submitView !== activeView) { setSaving(false); return; }
     let data = {};
     try { data = await resp.json(); } catch (_) { /* 保留已输入内容 */ }
-    if (submitView !== activeView) return;
+    if (submitView !== activeView) { setSaving(false); return; }
     const saved = mode === "edit" ? resp.status === 200 : resp.status === 201;
     if (saved && data.id !== undefined) {
+      setSaving(false);
       if (mode === "create") {
         form.reset();
         qBox.replaceChildren();
@@ -440,7 +477,9 @@ function buildSurveyForm(existing, hooks, view) {
       renderSaveStatus(true);
       return;
     }
-    // 服务端未确认保存成功：不清空任何输入，展示具体问题
+    // 服务端未确认保存成功：结束等待、恢复保存入口，不清空任何输入，展示具体问题
+    setSaving(false);
+    hideSaveStatus();
     showBanner([{el: null, msg: data.error || `保存失败（HTTP ${resp.status}），问卷未保存，请检查后重试。`}]);
   }
 
