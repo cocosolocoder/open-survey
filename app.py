@@ -87,6 +87,18 @@ const app = document.getElementById("app");
 // 返回也必须丢弃，不能覆盖用户当前所在页面。
 let activeView = 0;
 
+// 首尾裁剪必须与接口（Python str.strip()）逐字符一致，网页校验、提交内容与
+// “是否还有未保存修改”的比较才能表达同一份文本含义。JS 原生 trim() 的字符集
+// 恰好不同：它会裁掉 U+FEFF（接口保留该字符），却不裁 U+0085 与 U+001C–
+// U+001F（接口会把它们当空白裁掉）。这里显式列出接口会裁的 29 个字符，
+// U+FEFF 刻意不在其中；内部字符（含内部换行）一律不动。说明字段从不裁剪。
+const API_TRIM_CLASS =
+  "\\t\\n\\v\\f\\r\\x1c-\\x1f\\x20\\u0085\\u00a0\\u1680" +
+  "\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const apiTrimRe = new RegExp(
+  "^[" + API_TRIM_CLASS + "]+|[" + API_TRIM_CLASS + "]+$", "g");
+function apiTrim(value) { return value.replace(apiTrimRe, ""); }
+
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
   if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -243,18 +255,19 @@ function buildSurveyForm(existing, hooks, view) {
     submitButton.textContent = submitButton.getAttribute("data-label");
   }
 
-  // 按与提交时完全相同的规则读取当前表单：标题/题目标题/选项去掉首尾空白，
-  // 说明与内部换行原样保留。返回结构可直接做整体相等比较，用来判断“点击保存
-  // 之后表单是否又被改过”。改过又恢复原值时结构相同，不会被当成有未保存修改。
+  // 按与提交时完全相同的规则读取当前表单：标题/题目标题/选项只按接口规则
+  // （apiTrim，与 Python strip 一致）去掉首尾空白，说明与内部换行原样保留。
+  // 返回结构可直接做整体相等比较，用来判断“点击保存之后表单是否又被改过”。
+  // 改过又恢复原值时结构相同，不会被当成有未保存修改。
   function currentState() {
     return {
-      title: titleInput.value.trim(),
+      title: apiTrim(titleInput.value),
       description: descArea.value,
       questions: [...qBox.querySelectorAll(".q-card")].map(card => ({
         type: card.dataset.type,
-        title: card.querySelector(".q-title").value.trim(),
+        title: apiTrim(card.querySelector(".q-title").value),
         required: card.querySelector(".q-required").checked,
-        options: [...card.querySelectorAll(".opt-text")].map(el => el.value.trim())
+        options: [...card.querySelectorAll(".opt-text")].map(el => apiTrim(el.value))
       }))
     };
   }
@@ -349,7 +362,7 @@ function buildSurveyForm(existing, hooks, view) {
     hideSaveStatus();
     const problems = [];
 
-    const title = titleInput.value.trim();
+    const title = apiTrim(titleInput.value);
     if (!title) {
       titleInput.classList.add("invalid");
       titleErr.textContent = "标题不能为空。";
@@ -366,7 +379,7 @@ function buildSurveyForm(existing, hooks, view) {
     cards.forEach((card, i) => {
       const loc = `第 ${i + 1} 题`;
       const titleEl = card.querySelector(".q-title");
-      const qTitle = titleEl.value.trim();
+      const qTitle = apiTrim(titleEl.value);
       if (!qTitle) {
         titleEl.classList.add("invalid");
         card.querySelector(".q-title-err").textContent = `${loc}：题目标题不能为空。`;
@@ -379,7 +392,7 @@ function buildSurveyForm(existing, hooks, view) {
       };
       if (card.dataset.type === "single_choice") {
         const optInputs = [...card.querySelectorAll(".opt-text")];
-        const values = optInputs.map(el => el.value.trim());
+        const values = optInputs.map(el => apiTrim(el.value));
         const optErr = card.querySelector(".opt-err");
         const seen = new Set();
         values.forEach((val, j) => {
