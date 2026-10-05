@@ -255,11 +255,13 @@ function buildSurveyForm(existing, hooks, view) {
     submitButton.textContent = submitButton.getAttribute("data-label");
   }
 
-  // 按与提交时完全相同的规则读取当前表单：标题/题目标题/选项只按接口规则
-  // （apiTrim，与 Python strip 一致）去掉首尾空白，说明与内部换行原样保留。
-  // 返回结构可直接做整体相等比较，用来判断“点击保存之后表单是否又被改过”。
-  // 改过又恢复原值时结构相同，不会被当成有未保存修改。
-  function currentState() {
+  // 整份草稿的唯一整理入口：保存时提交的内容、保存前的校验、编辑页判断
+  // “等待保存期间是否又有修改”都从这里取数，规则只维护这一份。标题/题目
+  // 标题/选项只按接口规则（apiTrim，与 Python strip 一致）去掉首尾空白，
+  // 说明与内部换行原样保留；题目与选项按页面当前顺序记录，必填勾选原样。
+  // 每次调用都返回新建的独立对象（后续输入不会改变已返回的快照），可直接
+  // 做整体相等比较：改过又恢复原值时结构相同，不会被当成有未保存修改。
+  function readDraft() {
     return {
       title: apiTrim(titleInput.value),
       description: descArea.value,
@@ -323,14 +325,14 @@ function buildSurveyForm(existing, hooks, view) {
     // 最近一次服务器确认保存的表单内容（点击保存时的快照）。它只用于成功返回
     // 后判断当前表单相对那次提交有没有新改动；等待期间的输入始终留在表单里，
     // 不会被它覆盖，也不会被自动补交。
-    let savedState = currentState();
+    let savedState = readDraft();
 
     function refreshDirty() {
       const dirtyNote = statusBar.querySelector("#save-note-dirty");
       // 尚未成功保存过（状态条隐藏）时无需提示。
       if (statusBar.hidden || !dirtyNote) return;
       // 与点击保存时的整份内容比较：改过又恢复原值即视为无未保存修改。
-      dirtyNote.hidden = sameState(currentState(), savedState);
+      dirtyNote.hidden = sameState(readDraft(), savedState);
     }
 
     // 监听编辑页上全部真实编辑动作（标题/说明/题目标题/选项输入、必填勾选、
@@ -350,7 +352,7 @@ function buildSurveyForm(existing, hooks, view) {
 
     hooks = hooks || {};
     hooks.markSaved = state => { savedState = state; };
-    hooks.isCurrent = state => sameState(currentState(), state);
+    hooks.isCurrent = state => sameState(readDraft(), state);
   }
 
   async function submitForm(event) {
@@ -362,8 +364,11 @@ function buildSurveyForm(existing, hooks, view) {
     hideSaveStatus();
     const problems = [];
 
-    const title = apiTrim(titleInput.value);
-    if (!title) {
+    // 点击保存这一刻的整份草稿：整理规则只有 readDraft 一处，校验、提交内容
+    // 与成功后的“是否有新修改”比较表达的都是同一份草稿。
+    const draft = readDraft();
+
+    if (!draft.title) {
       titleInput.classList.add("invalid");
       titleErr.textContent = "标题不能为空。";
       problems.push({el: titleInput, msg: "问卷标题不能为空。"});
@@ -375,27 +380,22 @@ function buildSurveyForm(existing, hooks, view) {
       problems.push({el: qBox, msg: "问卷至少需要保留一道题，请先添加题目。"});
     }
 
-    const payloadQuestions = [];
+    // 校验针对整理后的草稿内容（空标题、空选项、同题重复选项都按裁剪后的值
+    // 判断），错误标记仍落在对应的页面输入框上；输入框原文保持不动。
     cards.forEach((card, i) => {
       const loc = `第 ${i + 1} 题`;
+      const question = draft.questions[i];
       const titleEl = card.querySelector(".q-title");
-      const qTitle = apiTrim(titleEl.value);
-      if (!qTitle) {
+      if (!question.title) {
         titleEl.classList.add("invalid");
         card.querySelector(".q-title-err").textContent = `${loc}：题目标题不能为空。`;
         problems.push({el: titleEl, msg: `${loc}：题目标题不能为空。`});
       }
-      const q = {
-        type: card.dataset.type,
-        title: qTitle,
-        required: card.querySelector(".q-required").checked
-      };
-      if (card.dataset.type === "single_choice") {
+      if (question.type === "single_choice") {
         const optInputs = [...card.querySelectorAll(".opt-text")];
-        const values = optInputs.map(el => apiTrim(el.value));
         const optErr = card.querySelector(".opt-err");
         const seen = new Set();
-        values.forEach((val, j) => {
+        question.options.forEach((val, j) => {
           if (!val) {
             optInputs[j].classList.add("invalid");
             optErr.textContent = `${loc}：第 ${j + 1} 个选项不能为空。`;
@@ -407,13 +407,11 @@ function buildSurveyForm(existing, hooks, view) {
           }
           seen.add(val);
         });
-        if (values.length < 2) {
+        if (question.options.length < 2) {
           optErr.textContent = `${loc}：单选题至少需要两个选项。`;
           problems.push({el: card.querySelector(".add-opt"), msg: `${loc}：单选题至少需要两个选项。`});
         }
-        q.options = values;
       }
-      payloadQuestions.push(q);
     });
 
     if (problems.length) {
@@ -425,16 +423,19 @@ function buildSurveyForm(existing, hooks, view) {
     saving = true;
     setSavingUI();
 
-    const payload = {title, description: descArea.value, questions: payloadQuestions};
-    // 点击保存这一刻的整份表单快照：这次请求只代表这份内容。成功返回后拿它与
-    // 当前表单比较——等待期间的任何输入/增删都不属于本次保存。
-    const submittedState = {
-      title,
-      description: descArea.value,
-      questions: payloadQuestions.map(q => ({
-        type: q.type, title: q.title, required: q.required, options: q.options || []
-      }))
+    // 提交内容就是这份草稿本身：文本题不带 options（接口接受省略或空数组），
+    // 单选题按整理后的选项内容与顺序提交。
+    const payload = {
+      title: draft.title,
+      description: draft.description,
+      questions: draft.questions.map(q => q.type === "single_choice"
+        ? {type: q.type, title: q.title, required: q.required, options: q.options}
+        : {type: q.type, title: q.title, required: q.required})
     };
+    // 点击保存这一刻的整份表单快照：这次请求只代表这份内容。readDraft 返回的
+    // 是独立对象，等待期间的后续输入不会改变它；成功返回后拿它与重新读取的
+    // 当前表单比较——等待期间的任何输入/增删都不属于本次保存。
+    const submittedState = draft;
     const endpoint = mode === "edit" ? `/api/surveys/${existing.id}` : "/api/surveys";
     // 这次保存只属于发起它的那一代表单；响应再晚返回，只要用户已经离开
     // （首页/详情/编辑切换、重新进入同一问卷、浏览器前进后退），其成功或
