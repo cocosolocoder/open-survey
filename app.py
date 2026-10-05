@@ -3,10 +3,11 @@
 import argparse
 import json
 import re
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import signal
 import sqlite3
+import threading
 from urllib.parse import urlsplit
 
 PRODUCT = "OpenSurvey"
@@ -617,7 +618,13 @@ def main():
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     args.data_dir.mkdir(parents=True, exist_ok=True)
-    database = sqlite3.connect(args.data_dir / "open-survey.sqlite")
+    # The server handles each connection on its own thread, so the database
+    # handle is shared across threads: disable the same-thread check and
+    # serialize every transaction with a lock. The lock is only held while
+    # running SQL, never while waiting for request bytes, so a stalled
+    # connection cannot block other requests.
+    database = sqlite3.connect(args.data_dir / "open-survey.sqlite", check_same_thread=False)
+    db_lock = threading.Lock()
     database.execute("CREATE TABLE IF NOT EXISTS surveys (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
     columns = {row[1] for row in database.execute("PRAGMA table_info(surveys)")}
     if "description" not in columns:
@@ -634,29 +641,30 @@ def main():
     database.commit()
 
     def survey_detail(survey_id):
-        row = database.execute(
-            "SELECT title, COALESCE(description, '') FROM surveys WHERE id = ?",
-            (survey_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        title, description = row
-        questions = []
-        question_rows = database.execute(
-            "SELECT id, type, title, required FROM questions WHERE survey_id = ? ORDER BY position",
-            (survey_id,),
-        ).fetchall()
-        for question_id, question_type, question_title, required in question_rows:
-            options = [option_row[0] for option_row in database.execute(
-                "SELECT text FROM question_options WHERE question_id = ? ORDER BY position",
-                (question_id,),
-            )]
-            questions.append({
-                "type": question_type,
-                "title": question_title,
-                "required": bool(required),
-                "options": options,
-            })
+        with db_lock:
+            row = database.execute(
+                "SELECT title, COALESCE(description, '') FROM surveys WHERE id = ?",
+                (survey_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            title, description = row
+            questions = []
+            question_rows = database.execute(
+                "SELECT id, type, title, required FROM questions WHERE survey_id = ? ORDER BY position",
+                (survey_id,),
+            ).fetchall()
+            for question_id, question_type, question_title, required in question_rows:
+                options = [option_row[0] for option_row in database.execute(
+                    "SELECT text FROM question_options WHERE question_id = ? ORDER BY position",
+                    (question_id,),
+                )]
+                questions.append({
+                    "type": question_type,
+                    "title": question_title,
+                    "required": bool(required),
+                    "options": options,
+                })
         return {
             "id": survey_id,
             "title": title,
@@ -666,21 +674,25 @@ def main():
 
     def save_survey(clean):
         """Insert the whole survey atomically; returns the new id."""
-        try:
-            cursor = database.execute(
-                "INSERT INTO surveys (title, description) VALUES (?, ?)",
-                (clean["title"], clean["description"]),
-            )
-            survey_id = cursor.lastrowid
-            write_questions(survey_id, clean["questions"])
-            database.commit()
-            return survey_id
-        except Exception:
-            database.rollback()
-            raise
+        with db_lock:
+            try:
+                cursor = database.execute(
+                    "INSERT INTO surveys (title, description) VALUES (?, ?)",
+                    (clean["title"], clean["description"]),
+                )
+                survey_id = cursor.lastrowid
+                write_questions(survey_id, clean["questions"])
+                database.commit()
+                return survey_id
+            except Exception:
+                database.rollback()
+                raise
 
     def write_questions(survey_id, questions):
-        """Replace all questions/options of a survey with the given ordered list."""
+        """Replace all questions/options of a survey with the given ordered list.
+
+        Caller must hold db_lock (invoked only from save_survey/replace_survey).
+        """
         old_question_ids = [row[0] for row in database.execute(
             "SELECT id FROM questions WHERE survey_id = ?", (survey_id,)
         )]
@@ -710,20 +722,21 @@ def main():
 
         Returns False when the survey does not exist (no record is created).
         """
-        row = database.execute("SELECT 1 FROM surveys WHERE id = ?", (survey_id,)).fetchone()
-        if row is None:
-            return False
-        try:
-            database.execute(
-                "UPDATE surveys SET title = ?, description = ? WHERE id = ?",
-                (clean["title"], clean["description"], survey_id),
-            )
-            write_questions(survey_id, clean["questions"])
-            database.commit()
-            return True
-        except Exception:
-            database.rollback()
-            raise
+        with db_lock:
+            row = database.execute("SELECT 1 FROM surveys WHERE id = ?", (survey_id,)).fetchone()
+            if row is None:
+                return False
+            try:
+                database.execute(
+                    "UPDATE surveys SET title = ?, description = ? WHERE id = ?",
+                    (clean["title"], clean["description"], survey_id),
+                )
+                write_questions(survey_id, clean["questions"])
+                database.commit()
+                return True
+            except Exception:
+                database.rollback()
+                raise
 
     class Handler(BaseHTTPRequestHandler):
         def respond(self, status, value, *, html=False, allow=None):
@@ -737,10 +750,11 @@ def main():
             self.wfile.write(payload)
 
         def list_surveys(self):
-            records = [
-                {"id": row[0], "title": row[1]}
-                for row in database.execute("SELECT id, title FROM surveys ORDER BY id")
-            ]
+            with db_lock:
+                records = [
+                    {"id": row[0], "title": row[1]}
+                    for row in database.execute("SELECT id, title FROM surveys ORDER BY id")
+                ]
             self.respond(200, {RESOURCE: records})
 
         def read_payload(self):
@@ -849,7 +863,12 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     server = None
     try:
-        server = HTTPServer((args.host, args.port), Handler)
+        # ThreadingHTTPServer serves every connection on its own daemon thread:
+        # a connection that sends nothing (browser spare connection) or only a
+        # partial request blocks only its own thread, never other requests.
+        # Daemon threads also let Ctrl+C stop the service even while such
+        # connections are still open.
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
         host, port = server.server_address[:2]
         address = f"[{host}]" if ":" in host else host
         print(f"{PRODUCT} listening on http://{address}:{port}", flush=True)
