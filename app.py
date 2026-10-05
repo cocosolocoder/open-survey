@@ -51,6 +51,7 @@ button{font:inherit;cursor:pointer}
 .opt-row{display:flex;align-items:center;gap:.6rem;margin:.4rem 0}
 .opt-index{color:var(--grey);font-size:.9rem;min-width:3.2rem}
 .banner{border:1px solid var(--red);background:#fdf3f2;color:var(--red);border-radius:.5rem;padding:.7rem 1rem;margin:1rem 0;white-space:normal}
+.notice{border:1px solid #2e7d32;background:#f1f8f1;color:#256b29;border-radius:.5rem;padding:.7rem 1rem;margin:1rem 0}
 .banner ul{margin:.4rem 0 0;padding-left:1.2rem}
 .banner button{color:var(--red);text-decoration:underline;background:none;border:none;padding:0;text-align:left}
 .field-err{color:var(--red);font-size:.85rem;margin:.25rem 0 0;min-height:1px}
@@ -100,6 +101,10 @@ function buildSurveyForm(existing, hooks, view) {
 
   const banner = h("div", {class: "banner", id: "form-banner"});
   banner.hidden = true;
+  // 保存成功但表单在等待期间又被改动时的提示条：与红色的失败 banner 区分，
+  // 明确说明“刚才提交的内容已保存”且“当前还有未保存的修改”。
+  const notice = h("div", {class: "notice", id: "form-notice"});
+  notice.hidden = true;
 
   const titleInput = h("textarea", {id: "survey-title", rows: "1", class: "grow",
     maxlength: "200", placeholder: "请输入问卷标题（可含换行）"});
@@ -185,6 +190,8 @@ function buildSurveyForm(existing, hooks, view) {
   function clearErrors() {
     banner.hidden = true;
     banner.replaceChildren();
+    notice.hidden = true;
+    notice.replaceChildren();
     titleErr.textContent = "";
     qErr.textContent = "";
     qBox.querySelectorAll(".invalid").forEach(el => el.classList.remove("invalid"));
@@ -212,6 +219,7 @@ function buildSurveyForm(existing, hooks, view) {
 
   const form = h("form", {id: "draft-form", onsubmit: submitForm},
     banner,
+    notice,
     h("section", null,
       h("h2", null, mode === "edit" ? `编辑问卷草稿 #${existing.id}` : "新建问卷草稿"),
       mode === "edit"
@@ -236,6 +244,27 @@ function buildSurveyForm(existing, hooks, view) {
     scheduleGrow(titleInput);
   }
 
+  // 收集当前表单要提交的整份内容：标题与选项去首尾空白、说明原样保留、
+  // 题目与选项按页面顺序。既用于提交，也用于保存成功返回时对比表单在
+  // 等待期间是否又被改动（改过后又恢复原样的视为没有改动）。
+  function currentPayload() {
+    return {
+      title: titleInput.value.trim(),
+      description: descArea.value,
+      questions: [...qBox.querySelectorAll(".q-card")].map(card => {
+        const q = {
+          type: card.dataset.type,
+          title: card.querySelector(".q-title").value.trim(),
+          required: card.querySelector(".q-required").checked
+        };
+        if (card.dataset.type === "single_choice") {
+          q.options = [...card.querySelectorAll(".opt-text")].map(el => el.value.trim());
+        }
+        return q;
+      })
+    };
+  }
+
   async function submitForm(event) {
     event.preventDefault();
     clearErrors();
@@ -254,7 +283,6 @@ function buildSurveyForm(existing, hooks, view) {
       problems.push({el: qBox, msg: "问卷至少需要保留一道题，请先添加题目。"});
     }
 
-    const payloadQuestions = [];
     cards.forEach((card, i) => {
       const loc = `第 ${i + 1} 题`;
       const titleEl = card.querySelector(".q-title");
@@ -264,11 +292,6 @@ function buildSurveyForm(existing, hooks, view) {
         card.querySelector(".q-title-err").textContent = `${loc}：题目标题不能为空。`;
         problems.push({el: titleEl, msg: `${loc}：题目标题不能为空。`});
       }
-      const q = {
-        type: card.dataset.type,
-        title: qTitle,
-        required: card.querySelector(".q-required").checked
-      };
       if (card.dataset.type === "single_choice") {
         const optInputs = [...card.querySelectorAll(".opt-text")];
         const values = optInputs.map(el => el.value.trim());
@@ -290,9 +313,7 @@ function buildSurveyForm(existing, hooks, view) {
           optErr.textContent = `${loc}：单选题至少需要两个选项。`;
           problems.push({el: card.querySelector(".add-opt"), msg: `${loc}：单选题至少需要两个选项。`});
         }
-        q.options = values;
       }
-      payloadQuestions.push(q);
     });
 
     if (problems.length) {
@@ -300,12 +321,15 @@ function buildSurveyForm(existing, hooks, view) {
       return;
     }
 
-    const payload = {title, description: descArea.value, questions: payloadQuestions};
+    const payload = currentPayload();
     const endpoint = mode === "edit" ? `/api/surveys/${existing.id}` : "/api/surveys";
     // 这次保存只属于发起它的那一代表单；响应再晚返回，只要用户已经离开
     // （首页/详情/编辑切换、重新进入同一问卷、浏览器前进后退），其成功或
     // 失败结果都必须静默丢弃，不能跳转、清空或提示到当前页面上。
     const submitView = view;
+    // 记录点击保存时实际提交的内容：保存成功返回时据此判断等待期间表单
+    // 是否又有新的修改，一次保存的结果只代表这次提交的内容。
+    const submittedJson = JSON.stringify(payload);
     let resp;
     try {
       resp = await fetch(endpoint, {
@@ -330,8 +354,25 @@ function buildSurveyForm(existing, hooks, view) {
         qBox.replaceChildren();
         autoGrow(titleInput);
         if (hooks && hooks.onCreated) hooks.onCreated();
+        location.hash = `#/surveys/${data.id}`;
+        return;
       }
-      location.hash = `#/surveys/${data.id}`;
+      if (JSON.stringify(currentPayload()) === submittedJson) {
+        // 表单内容与点击保存时一致（等待期间没改过，或改过又恢复原样）：
+        // 按原功能进入该问卷详情。
+        location.hash = `#/surveys/${data.id}`;
+        return;
+      }
+      // 等待保存期间表单又有新修改：服务器保存的是点击保存时提交的内容，
+      // 当前表单的完整内容与顺序原样保留，停留在编辑页，明确区分“刚才
+      // 提交的已保存”与“当前还有未保存的修改”；既不自动补交新修改，也
+      // 不撤销已成功的保存。用户可继续编辑或再次点击保存。
+      notice.replaceChildren(
+        h("strong", null, "刚才提交的修改已保存。"),
+        "等待保存期间表单又有新的修改，当前还有未保存的修改：服务器上的草稿仍是刚才提交的内容。可继续编辑，或再次点击“保存修改”保存当前内容。"
+      );
+      notice.hidden = false;
+      notice.scrollIntoView({behavior: "smooth", block: "nearest"});
       return;
     }
     // 服务端未确认保存成功：不清空任何输入，展示具体问题
