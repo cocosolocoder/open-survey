@@ -59,6 +59,9 @@ button{font:inherit;cursor:pointer}
 .save-note{border-radius:.5rem;padding:.7rem 1rem;white-space:normal}
 .save-note.saved{border:1px solid #1e7e45;background:#ecf7f0;color:#155c33}
 .save-note.dirty{border:1px solid #9a6d12;background:#fdf6e3;color:#7a5207}
+/* 等待保存结果：蓝色中性提示，与成功（绿）、未保存（黄）、错误（红）区分 */
+.save-note.saving{border:1px solid var(--blue);background:#eef4fb;color:#144a80}
+button:disabled{opacity:.55;cursor:not-allowed}
 .field-err{color:var(--red);font-size:.85rem;margin:.25rem 0 0;min-height:1px}
 .invalid{border-color:var(--red)!important;background:#fdf6f5}
 .detail-meta{color:var(--grey);font-size:.9rem}
@@ -222,6 +225,24 @@ function buildSurveyForm(existing, hooks, view) {
     statusBar.hidden = false;
   }
 
+  // 一次保存进行中：保存按钮禁用并明确显示“正在保存…”，状态条显示等待提示。
+  // 在请求有明确结果前，重复点击按钮或用键盘再次提交都不会追加请求，也不会
+  // 清掉等待提示。等待期间标题、说明、题目、选项、必填与增删操作全部可用。
+  let saving = false;
+  function setSavingUI() {
+    submitButton.disabled = true;
+    submitButton.textContent = "正在保存…";
+    statusBar.replaceChildren(
+      h("div", {class: "save-note saving", id: "save-note-saving", role: "status"},
+        h("strong", null, "正在保存：正在等待本次保存的结果，请稍候。等待期间仍可继续编辑，这些改动不会自动追加到本次提交。"))
+    );
+    statusBar.hidden = false;
+  }
+  function resetSaveButton() {
+    submitButton.disabled = false;
+    submitButton.textContent = submitButton.getAttribute("data-label");
+  }
+
   // 按与提交时完全相同的规则读取当前表单：标题/题目标题/选项去掉首尾空白，
   // 说明与内部换行原样保留。返回结构可直接做整体相等比较，用来判断“点击保存
   // 之后表单是否又被改过”。改过又恢复原值时结构相同，不会被当成有未保存修改。
@@ -256,8 +277,9 @@ function buildSurveyForm(existing, hooks, view) {
     // 离开编辑页即丢弃全部未保存的增删与输入
     actionButtons.push(h("a", {class: "btn secondary", href: `#/surveys/${existing.id}`}, "取消"));
   }
-  actionButtons.push(h("button", {type: "submit", class: "btn"},
-    mode === "edit" ? "保存修改" : "保存整份问卷"));
+  const submitLabel = mode === "edit" ? "保存修改" : "保存整份问卷";
+  const submitButton = h("button", {type: "submit", class: "btn", "data-label": submitLabel}, submitLabel);
+  actionButtons.push(submitButton);
 
   const form = h("form", {id: "draft-form", onsubmit: submitForm},
     banner,
@@ -320,6 +342,9 @@ function buildSurveyForm(existing, hooks, view) {
 
   async function submitForm(event) {
     event.preventDefault();
+    // 已有一次保存尚未得到明确结果：忽略后续点击/键盘提交，不追加请求，也不
+    // 清除正在显示的等待状态。本次保存只代表首次点击时的那份表单快照。
+    if (saving) return;
     clearErrors();
     hideSaveStatus();
     const problems = [];
@@ -382,6 +407,10 @@ function buildSurveyForm(existing, hooks, view) {
       showBanner(problems);
       return;
     }
+    // 校验通过、请求即将发出：此后到拿到明确结果前只能有这一次保存进行中。
+    // 纯客户端校验拒绝不会走到这里，因此不会留下等待状态。
+    saving = true;
+    setSavingUI();
 
     const payload = {title, description: descArea.value, questions: payloadQuestions};
     // 点击保存这一刻的整份表单快照：这次请求只代表这份内容。成功返回后拿它与
@@ -407,7 +436,10 @@ function buildSurveyForm(existing, hooks, view) {
       });
     } catch (err) {
       if (submitView !== activeView) return;
-      // 请求未成功：保留当前全部输入与增删结果
+      // 请求未成功：结束等待，保留当前全部输入与增删结果，允许修改后再次保存。
+      saving = false;
+      resetSaveButton();
+      hideSaveStatus();
       showBanner([{el: null, msg: `网络错误，问卷尚未保存：${err}`}]);
       return;
     }
@@ -436,11 +468,18 @@ function buildSurveyForm(existing, hooks, view) {
       }
       // 等待期间出现了新的修改：留在编辑页，保留当前完整内容与顺序。绿色块
       // 只确认“刚才提交的内容已保存”，黄色块提示“当前还有未保存的修改”，
-      // 不自动补交，也不撤销已成功的保存。
+      // 不自动补交，也不撤销已成功的保存。保存恢复可用，再次点击提交的才是
+      // 当前内容，而不是沿用上一笔提交的旧内容。
+      saving = false;
+      resetSaveButton();
       renderSaveStatus(true);
       return;
     }
-    // 服务端未确认保存成功：不清空任何输入，展示具体问题
+    // 服务端未确认保存成功：结束等待，不清空任何输入，展示具体问题；用户修改
+    // 后可再次保存（不会自行重发，也不会一直停在“正在保存”）。
+    saving = false;
+    resetSaveButton();
+    hideSaveStatus();
     showBanner([{el: null, msg: data.error || `保存失败（HTTP ${resp.status}），问卷未保存，请检查后重试。`}]);
   }
 
