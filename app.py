@@ -99,6 +99,38 @@ const apiTrimRe = new RegExp(
   "^[" + API_TRIM_CLASS + "]+|[" + API_TRIM_CLASS + "]+$", "g");
 function apiTrim(value) { return value.replace(apiTrimRe, ""); }
 
+// 换行归一化：接口会原样保留文本内部的回车换行（CRLF，\r\n）、单独回车
+// （CR，\r）与换行（LF，\n），但这些值赋给 textarea 后会被浏览器立即统一
+// 成 LF（实测在赋值给 .value 的那一刻即发生）。因此编辑页必须在把原稿送进
+// 输入框之前记录原始字符串，保存时再按“可见内容是否改变”决定还原原稿还是
+// 采用当前输入；比较一律基于归一化为 LF 的文本，使三种换行在编辑框里的同
+// 一份可见内容被视为“没有改变”。
+function normalizeNL(value) { return value.replace(/\r\n|\r|\n/g, "\n"); }
+
+// 仅编辑模式使用：输入框元素 -> 打开编辑页时该字段从接口读到的原始字符串。
+// 用 WeakMap 是为了让随题目/选项删除而移除的元素连同记录一起被回收，绝不
+// 需要手工清理，也不会把已删除行的原文错配到后来顶上来的另一行。新建模式
+// 下不写入任何记录。
+const origMap = new WeakMap();
+function rememberOriginal(el, raw) { origMap.set(el, String(raw)); }
+
+// 计算一个文本字段“实际要保存”的字符串：
+// - 编辑模式且该字段可见内容与打开时一致：还原为原稿，保留原始 CRLF/CR/LF；
+// - 其余情况（真正修改过，或新建模式）：采用输入框当前文本（浏览器统一为 LF）。
+// 比较规则与“判断文字是否改变”的既有规则一致：trimFields 为真时（问卷标题、
+// 题目标题、选项）首尾空白不参与比较，因此只增删首尾空白也算未改变、仍还原
+// 原稿（原稿内部的 CRLF/CR 不会因此被 LF 覆盖）；说明字段不裁剪，逐字符比较。
+function resolveFieldValue(el, {trimFields = false} = {}) {
+  const current = el.value;
+  const original = origMap.get(el);
+  if (original !== undefined) {
+    const a = trimFields ? apiTrim(normalizeNL(current)) : normalizeNL(current);
+    const b = trimFields ? apiTrim(normalizeNL(original)) : normalizeNL(original);
+    if (a === b) return original;
+  }
+  return current;
+}
+
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
   if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -156,7 +188,12 @@ function buildSurveyForm(existing, hooks, view) {
   function optionRow(value) {
     const text = h("textarea", {rows: "1", class: "opt-text grow", placeholder: "选项内容（可含换行）"});
     text.addEventListener("input", () => autoGrow(text));
-    if (value !== undefined && value !== null) { text.value = value; scheduleGrow(text); }
+    if (value !== undefined && value !== null) {
+      // 必须在写入 .value 之前记录原稿：赋值一旦发生，CRLF/CR 就已被浏览器
+      // 归一化成 LF，之后再读 text.value 也拿不回原始换行形式。
+      if (mode === "edit") rememberOriginal(text, value);
+      text.value = value; scheduleGrow(text);
+    }
     const row = h("div", {class: "opt-row"},
       h("span", {class: "opt-index"}, "选项"),
       text,
@@ -198,6 +235,8 @@ function buildSurveyForm(existing, hooks, view) {
     const qTitleEl = card.querySelector(".q-title");
     qTitleEl.addEventListener("input", () => autoGrow(qTitleEl));
     if (prefill) {
+      // 与选项同理：在 .value 赋值（会把 CRLF/CR 归一化成 LF）之前先记住原稿。
+      if (mode === "edit" && prefill.title != null) rememberOriginal(qTitleEl, prefill.title);
       qTitleEl.value = prefill.title != null ? prefill.title : "";
       card.querySelector(".q-required").checked = !!prefill.required;
     }
@@ -259,17 +298,21 @@ function buildSurveyForm(existing, hooks, view) {
   // “等待保存期间是否又有修改”都从这里取数，规则只维护这一份。标题/题目
   // 标题/选项只按接口规则（apiTrim，与 Python strip 一致）去掉首尾空白，
   // 说明与内部换行原样保留；题目与选项按页面当前顺序记录，必填勾选原样。
+  // 编辑模式下未改动的字段（含“改过又恢复”）由 resolveFieldValue 还原为
+  // 打开时从接口读到的原稿，使内部 CRLF/CR/LF 不被浏览器的换行归一化改写；
+  // 真正改动的字段与新建模式一律采用当前输入（浏览器中只会是 LF）。
   // 每次调用都返回新建的独立对象（后续输入不会改变已返回的快照），可直接
   // 做整体相等比较：改过又恢复原值时结构相同，不会被当成有未保存修改。
   function readDraft() {
     return {
-      title: apiTrim(titleInput.value),
-      description: descArea.value,
+      title: apiTrim(resolveFieldValue(titleInput, {trimFields: true})),
+      description: resolveFieldValue(descArea),
       questions: [...qBox.querySelectorAll(".q-card")].map(card => ({
         type: card.dataset.type,
-        title: apiTrim(card.querySelector(".q-title").value),
+        title: apiTrim(resolveFieldValue(card.querySelector(".q-title"), {trimFields: true})),
         required: card.querySelector(".q-required").checked,
-        options: [...card.querySelectorAll(".opt-text")].map(el => apiTrim(el.value))
+        options: [...card.querySelectorAll(".opt-text")]
+          .map(el => apiTrim(resolveFieldValue(el, {trimFields: true})))
       }))
     };
   }
@@ -316,6 +359,9 @@ function buildSurveyForm(existing, hooks, view) {
 
   titleInput.addEventListener("input", () => autoGrow(titleInput));
   if (mode === "edit") {
+    // 同样在赋值（会归一化换行）之前记下原稿；说明字段不裁剪、逐字符比较。
+    rememberOriginal(titleInput, existing.title != null ? existing.title : "");
+    rememberOriginal(descArea, existing.description || "");
     titleInput.value = existing.title != null ? existing.title : "";
     descArea.value = existing.description || "";
     existing.questions.forEach(question => addQuestion(question.type, question));
