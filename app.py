@@ -99,6 +99,24 @@ const apiTrimRe = new RegExp(
   "^[" + API_TRIM_CLASS + "]+|[" + API_TRIM_CLASS + "]+$", "g");
 function apiTrim(value) { return value.replace(apiTrimRe, ""); }
 
+// 浏览器 textarea 的值会把 CRLF 与单独的 CR 统一改写成 LF（HTML 规范的值净化），
+// 因此接口保留的 \r\n、\r 进入编辑框后读回来都变成 \n。判断“用户有没有改动这个
+// 字段”必须按显示出来的内容比较：把原文也归一到 LF 再对照，归一后相同即视为
+// 未改变（输入后又恢复成原来的可见内容也算未改变）。
+const TEXTAREA_LF_RE = /\r\n|\r/g;
+function lfOnly(value) { return value.replace(TEXTAREA_LF_RE, "\n"); }
+
+// 单个字段的保存值：编辑页预填时把接口原文记在元素的 _originalValue 上。可见
+// 内容与打开编辑页时相同（LF 归一后相等）就提交原文，保留其换行形式不被浏览器
+// 的显示差异改写；确实改过才提交当前输入。新建表单与编辑中新增的题目/选项没有
+// 原文，始终按当前输入保存。原文记在各自元素上而不是按文字查找，因此删除前面
+// 的题目或选项后，同名题与显示相同的选项仍各自对应自己的原文。
+function fieldDraftValue(el) {
+  const original = el._originalValue;
+  if (typeof original === "string" && el.value === lfOnly(original)) return original;
+  return el.value;
+}
+
 function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
   if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -156,7 +174,12 @@ function buildSurveyForm(existing, hooks, view) {
   function optionRow(value) {
     const text = h("textarea", {rows: "1", class: "opt-text grow", placeholder: "选项内容（可含换行）"});
     text.addEventListener("input", () => autoGrow(text));
-    if (value !== undefined && value !== null) { text.value = value; scheduleGrow(text); }
+    if (value !== undefined && value !== null) {
+      text.value = value;
+      // 预填的选项记住接口原文：未改动时按原文保存（含其内部换行形式）。
+      text._originalValue = value;
+      scheduleGrow(text);
+    }
     const row = h("div", {class: "opt-row"},
       h("span", {class: "opt-index"}, "选项"),
       text,
@@ -198,7 +221,10 @@ function buildSurveyForm(existing, hooks, view) {
     const qTitleEl = card.querySelector(".q-title");
     qTitleEl.addEventListener("input", () => autoGrow(qTitleEl));
     if (prefill) {
-      qTitleEl.value = prefill.title != null ? prefill.title : "";
+      // 先记原文再赋值：textarea 会把值里的 CRLF/CR 净化成 LF，原文必须取
+      // 接口返回的字符串本身，不能回读输入框。
+      qTitleEl._originalValue = prefill.title != null ? prefill.title : "";
+      qTitleEl.value = qTitleEl._originalValue;
       card.querySelector(".q-required").checked = !!prefill.required;
     }
     scheduleGrow(qTitleEl);
@@ -256,20 +282,23 @@ function buildSurveyForm(existing, hooks, view) {
   }
 
   // 整份草稿的唯一整理入口：保存时提交的内容、保存前的校验、编辑页判断
-  // “等待保存期间是否又有修改”都从这里取数，规则只维护这一份。标题/题目
-  // 标题/选项只按接口规则（apiTrim，与 Python strip 一致）去掉首尾空白，
-  // 说明与内部换行原样保留；题目与选项按页面当前顺序记录，必填勾选原样。
+  // “等待保存期间是否又有修改”都从这里取数，规则只维护这一份。每个字段先经
+  // fieldDraftValue 取回保存值（可见内容未变时用打开编辑页时的接口原文，保留
+  // 其内部 CRLF/CR/LF 形式；确实改过才用当前输入），随后标题/题目标题/选项只按
+  // 接口规则（apiTrim，与 Python strip 一致）去掉首尾空白，说明与内部换行原样
+  // 保留；题目与选项按页面当前顺序记录，必填勾选原样。重复选项按这里整理出的
+  // 实际保存值判断：仅在内部换行形式上不同的两个选项不算重复，可以一起保存。
   // 每次调用都返回新建的独立对象（后续输入不会改变已返回的快照），可直接
   // 做整体相等比较：改过又恢复原值时结构相同，不会被当成有未保存修改。
   function readDraft() {
     return {
-      title: apiTrim(titleInput.value),
-      description: descArea.value,
+      title: apiTrim(fieldDraftValue(titleInput)),
+      description: fieldDraftValue(descArea),
       questions: [...qBox.querySelectorAll(".q-card")].map(card => ({
         type: card.dataset.type,
-        title: apiTrim(card.querySelector(".q-title").value),
+        title: apiTrim(fieldDraftValue(card.querySelector(".q-title"))),
         required: card.querySelector(".q-required").checked,
-        options: [...card.querySelectorAll(".opt-text")].map(el => apiTrim(el.value))
+        options: [...card.querySelectorAll(".opt-text")].map(el => apiTrim(fieldDraftValue(el)))
       }))
     };
   }
@@ -316,8 +345,11 @@ function buildSurveyForm(existing, hooks, view) {
 
   titleInput.addEventListener("input", () => autoGrow(titleInput));
   if (mode === "edit") {
-    titleInput.value = existing.title != null ? existing.title : "";
-    descArea.value = existing.description || "";
+    // 标题与说明同样先记接口原文再赋值（说明从不裁剪，首尾空白也在原文里）。
+    titleInput._originalValue = existing.title != null ? existing.title : "";
+    titleInput.value = titleInput._originalValue;
+    descArea._originalValue = existing.description || "";
+    descArea.value = descArea._originalValue;
     existing.questions.forEach(question => addQuestion(question.type, question));
     renumber();
     scheduleGrow(titleInput);
