@@ -53,6 +53,12 @@ button{font:inherit;cursor:pointer}
 .banner{border:1px solid var(--red);background:#fdf3f2;color:var(--red);border-radius:.5rem;padding:.7rem 1rem;margin:1rem 0;white-space:normal}
 .banner ul{margin:.4rem 0 0;padding-left:1.2rem}
 .banner button{color:var(--red);text-decoration:underline;background:none;border:none;padding:0;text-align:left}
+/* 保存状态条：与错误提示条区分开，明确“刚才那次提交已保存”与“还有未保存修改” */
+.save-status{margin:1rem 0;display:flex;flex-direction:column;gap:.5rem}
+.save-status[hidden]{display:none}
+.save-note{border-radius:.5rem;padding:.7rem 1rem;white-space:normal}
+.save-note.saved{border:1px solid #1e7e45;background:#ecf7f0;color:#155c33}
+.save-note.dirty{border:1px solid #9a6d12;background:#fdf6e3;color:#7a5207}
 .field-err{color:var(--red);font-size:.85rem;margin:.25rem 0 0;min-height:1px}
 .invalid{border-color:var(--red)!important;background:#fdf6f5}
 .detail-meta{color:var(--grey);font-size:.9rem}
@@ -100,6 +106,11 @@ function buildSurveyForm(existing, hooks, view) {
 
   const banner = h("div", {class: "banner", id: "form-banner"});
   banner.hidden = true;
+
+  // 编辑模式下保存结果的状态条：成功保存与“仍有未保存修改”必须分开展示，
+  // 不能只给一条笼统的“保存成功”。新建模式不使用它（保存成功即进入详情）。
+  const statusBar = h("div", {class: "save-status", id: "save-status", role: "status"});
+  statusBar.hidden = true;
 
   const titleInput = h("textarea", {id: "survey-title", rows: "1", class: "grow",
     maxlength: "200", placeholder: "请输入问卷标题（可含换行）"});
@@ -191,6 +202,44 @@ function buildSurveyForm(existing, hooks, view) {
     qBox.querySelectorAll(".field-err").forEach(el => { el.textContent = ""; });
   }
 
+  function hideSaveStatus() {
+    statusBar.hidden = true;
+    statusBar.replaceChildren();
+  }
+
+  // 保存成功后：绿色块只陈述“刚才提交的内容已保存”；若等待期间又有修改，
+  // 再追加一块黄色“当前还有未保存的修改”。两者同时出现、含义互不混淆。
+  function renderSaveStatus(dirty) {
+    statusBar.replaceChildren(
+      h("div", {class: "save-note saved", id: "save-note-saved"},
+        h("strong", null, "已保存：刚才提交的内容已保存到服务器。")),
+      dirty
+        ? h("div", {class: "save-note dirty", id: "save-note-dirty"},
+            h("strong", null,
+              "当前还有未保存的修改：页面内容在点击保存后又被改动（等待结果期间的修改不会自动补交）。可继续编辑，并再次点击“保存修改”。"))
+        : null
+    );
+    statusBar.hidden = false;
+  }
+
+  // 按与提交时完全相同的规则读取当前表单：标题/题目标题/选项去掉首尾空白，
+  // 说明与内部换行原样保留。返回结构可直接做整体相等比较，用来判断“点击保存
+  // 之后表单是否又被改过”。改过又恢复原值时结构相同，不会被当成有未保存修改。
+  function currentState() {
+    return {
+      title: titleInput.value.trim(),
+      description: descArea.value,
+      questions: [...qBox.querySelectorAll(".q-card")].map(card => ({
+        type: card.dataset.type,
+        title: card.querySelector(".q-title").value.trim(),
+        required: card.querySelector(".q-required").checked,
+        options: [...card.querySelectorAll(".opt-text")].map(el => el.value.trim())
+      }))
+    };
+  }
+
+  function sameState(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
   function showBanner(items) {
     banner.replaceChildren(h("strong", null, "问卷未能保存，请修改后重试："), h("ul", null,
       items.map(it => h("li", null, h("button", {type: "button", onclick: () => it.el && it.el.focus()}, it.msg)))));
@@ -212,6 +261,7 @@ function buildSurveyForm(existing, hooks, view) {
 
   const form = h("form", {id: "draft-form", onsubmit: submitForm},
     banner,
+    statusBar,
     h("section", null,
       h("h2", null, mode === "edit" ? `编辑问卷草稿 #${existing.id}` : "新建问卷草稿"),
       mode === "edit"
@@ -234,11 +284,44 @@ function buildSurveyForm(existing, hooks, view) {
     existing.questions.forEach(question => addQuestion(question.type, question));
     renumber();
     scheduleGrow(titleInput);
+
+    // 最近一次服务器确认保存的表单内容（点击保存时的快照）。它只用于成功返回
+    // 后判断当前表单相对那次提交有没有新改动；等待期间的输入始终留在表单里，
+    // 不会被它覆盖，也不会被自动补交。
+    let savedState = currentState();
+
+    function refreshDirty() {
+      const dirtyNote = statusBar.querySelector("#save-note-dirty");
+      // 尚未成功保存过（状态条隐藏）时无需提示。
+      if (statusBar.hidden || !dirtyNote) return;
+      // 与点击保存时的整份内容比较：改过又恢复原值即视为无未保存修改。
+      dirtyNote.hidden = sameState(currentState(), savedState);
+    }
+
+    // 监听编辑页上全部真实编辑动作（标题/说明/题目标题/选项输入、必填勾选、
+    // 题目与选项增删）。题目卡片是动态增删的，因此在表单上做事件委托。
+    form.addEventListener("input", refreshDirty);
+    form.addEventListener("change", event => {
+      if (event.target.closest && event.target.closest(".q-required")) refreshDirty();
+    });
+    form.addEventListener("click", event => {
+      const actionable = event.target.closest
+        && event.target.closest("button.add-opt, button.link.danger, button.btn.secondary");
+      if (actionable) {
+        // 新增/删除在本次点击处理中完成，延到冒泡后再读取最终 DOM。
+        queueMicrotask(refreshDirty);
+      }
+    });
+
+    hooks = hooks || {};
+    hooks.markSaved = state => { savedState = state; };
+    hooks.isCurrent = state => sameState(currentState(), state);
   }
 
   async function submitForm(event) {
     event.preventDefault();
     clearErrors();
+    hideSaveStatus();
     const problems = [];
 
     const title = titleInput.value.trim();
@@ -301,6 +384,15 @@ function buildSurveyForm(existing, hooks, view) {
     }
 
     const payload = {title, description: descArea.value, questions: payloadQuestions};
+    // 点击保存这一刻的整份表单快照：这次请求只代表这份内容。成功返回后拿它与
+    // 当前表单比较——等待期间的任何输入/增删都不属于本次保存。
+    const submittedState = {
+      title,
+      description: descArea.value,
+      questions: payloadQuestions.map(q => ({
+        type: q.type, title: q.title, required: q.required, options: q.options || []
+      }))
+    };
     const endpoint = mode === "edit" ? `/api/surveys/${existing.id}` : "/api/surveys";
     // 这次保存只属于发起它的那一代表单；响应再晚返回，只要用户已经离开
     // （首页/详情/编辑切换、重新进入同一问卷、浏览器前进后退），其成功或
@@ -330,8 +422,22 @@ function buildSurveyForm(existing, hooks, view) {
         qBox.replaceChildren();
         autoGrow(titleInput);
         if (hooks && hooks.onCreated) hooks.onCreated();
+        location.hash = `#/surveys/${data.id}`;
+        return;
       }
-      location.hash = `#/surveys/${data.id}`;
+      // 编辑模式：先把“这次提交的内容”记为已保存（服务器上的草稿正是它）。
+      if (hooks && hooks.markSaved) hooks.markSaved(submittedState);
+      // 比较点击保存前后的整份表单：等待期间改过又恢复原值时结构相同，按
+      // 无新改动处理，仍进入详情。
+      const stillSame = hooks && hooks.isCurrent ? hooks.isCurrent(submittedState) : true;
+      if (stillSame) {
+        location.hash = `#/surveys/${data.id}`;
+        return;
+      }
+      // 等待期间出现了新的修改：留在编辑页，保留当前完整内容与顺序。绿色块
+      // 只确认“刚才提交的内容已保存”，黄色块提示“当前还有未保存的修改”，
+      // 不自动补交，也不撤销已成功的保存。
+      renderSaveStatus(true);
       return;
     }
     // 服务端未确认保存成功：不清空任何输入，展示具体问题
