@@ -15,6 +15,22 @@ RESOURCE = "surveys"
 MAX_BODY_BYTES = 10 * 1024 * 1024
 QUESTION_TYPES = ("text", "single_choice")
 
+
+def json_response_bytes(value):
+    """Serialize value to UTF-8 JSON bytes, never failing on a lone surrogate.
+
+    Survey content is validated (unpaired surrogates rejected) before it gets
+    here; escaping any stray surrogate as ``\\uXXXX`` is only a safety net so
+    an unexpected error response can never abort mid-write and leave the
+    caller with a dropped connection instead of parseable JSON.
+    """
+    text = json.dumps(value, ensure_ascii=False)
+    text = "".join(
+        f"\\u{ord(ch):04x}" if 0xD800 <= ord(ch) <= 0xDFFF else ch
+        for ch in text
+    )
+    return text.encode("utf8")
+
 PAGE = r"""<!doctype html>
 <html lang="zh-CN">
 <meta charset="utf-8">
@@ -770,6 +786,52 @@ route();
 """
 
 
+def contains_unpaired_surrogate(text):
+    """True if text holds an unpaired UTF-16 surrogate code point (U+D800..U+DFFF).
+
+    A syntactically legal JSON body can still contain one via an unpaired
+    ``\\uD800``/``\\uDC00`` escape. Such a code point cannot be encoded as
+    UTF-8, so it must be rejected as a content error of the specific field
+    before saving: otherwise encoding the response later aborts the request
+    without returning the validation result the caller expects. Correctly
+    paired escapes decode to a single astral character (e.g. an emoji) and
+    never match this check.
+    """
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
+def surrogate_content_error(field_label, text):
+    """Build a 400 message naming the field that holds an unpaired surrogate.
+
+    The offending code point is shown as U+XXXX instead of embedding the
+    broken character, so the error message itself is always UTF-8 encodable
+    and the error response stays parseable JSON.
+    """
+    for ch in text:
+        if 0xD800 <= ord(ch) <= 0xDFFF:
+            return (
+                f"{field_label}包含无法编码保存的字符"
+                f"（未配对的 Unicode 代理码点 U+{ord(ch):04X}），"
+                f"请删除或修改该字符后重试"
+            )
+    raise AssertionError("text contains no unpaired surrogate")
+
+
+def safe_quote_json_string(text):
+    """Return a JSON-quoted form of text with lone surrogates escaped.
+
+    Behaves like ``json.dumps(text, ensure_ascii=False)`` but renders each
+    unpaired surrogate as ``\\uXXXX`` so the result is always valid,
+    UTF-8-encodable JSON. Used when echoing caller-provided strings inside an
+    error message, where the raw character would break error encoding.
+    """
+    quoted = json.dumps(text, ensure_ascii=False)
+    return "".join(
+        f"\\u{ord(ch):04x}" if 0xD800 <= ord(ch) <= 0xDFFF else ch
+        for ch in quoted
+    )
+
+
 def validate_survey(obj):
     """Validate a decoded survey payload.
 
@@ -784,6 +846,8 @@ def validate_survey(obj):
     title = obj["title"]
     if not isinstance(title, str):
         return None, "title 必须是字符串"
+    if contains_unpaired_surrogate(title):
+        return None, surrogate_content_error("问卷标题", title)
     title = title.strip()
     if not title:
         return None, "title 不能为空（或全为空白字符）"
@@ -791,6 +855,8 @@ def validate_survey(obj):
     description = obj.get("description", "")
     if not isinstance(description, str):
         return None, "description 必须是字符串"
+    if contains_unpaired_surrogate(description):
+        return None, surrogate_content_error("问卷说明", description)
 
     if "questions" not in obj:
         return None, "缺少字段 questions"
@@ -812,7 +878,9 @@ def validate_survey(obj):
         if not isinstance(question_type, str):
             return None, f"{location}：type 必须是字符串"
         if question_type not in QUESTION_TYPES:
-            shown = json.dumps(question_type, ensure_ascii=False)
+            # 不能把未配对的代理码点直接拼进错误信息，否则错误响应自身无法
+            # 编码、会再次中断请求；safe_quote_json_string 只转义代理码点。
+            shown = safe_quote_json_string(question_type)
             return None, f"{location}：不支持的题型 {shown}（仅支持 text 或 single_choice）"
 
         if "title" not in raw_question:
@@ -820,6 +888,8 @@ def validate_survey(obj):
         question_title = raw_question["title"]
         if not isinstance(question_title, str):
             return None, f"{location}：title 必须是字符串"
+        if contains_unpaired_surrogate(question_title):
+            return None, surrogate_content_error(f"{location}的题目标题", question_title)
         question_title = question_title.strip()
         if not question_title:
             return None, f"{location}：题目标题不能为空（或全为空白字符）"
@@ -843,11 +913,14 @@ def validate_survey(obj):
             for option_index, raw_option in enumerate(raw_options, start=1):
                 if not isinstance(raw_option, str):
                     return None, f"{location}：第 {option_index} 个选项必须是字符串"
+                if contains_unpaired_surrogate(raw_option):
+                    field_label = f"{location}的第 {option_index} 个选项"
+                    return None, surrogate_content_error(field_label, raw_option)
                 option = raw_option.strip()
                 if not option:
                     return None, f"{location}：第 {option_index} 个选项不能为空（或全为空白字符）"
                 if option in seen:
-                    shown = json.dumps(option, ensure_ascii=False)
+                    shown = safe_quote_json_string(option)
                     return None, f"{location}：选项 {shown} 重复（同一题内选项不得重复）"
                 seen.add(option)
                 options.append(option)
@@ -994,7 +1067,7 @@ def main():
 
     class Handler(BaseHTTPRequestHandler):
         def respond(self, status, value, *, html=False, allow=None):
-            payload = value.encode("utf8") if html else json.dumps(value, ensure_ascii=False).encode("utf8")
+            payload = value.encode("utf8") if html else json_response_bytes(value)
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8" if html else "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
