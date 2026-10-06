@@ -604,17 +604,28 @@ function renderHome() {
   );
   const listEl = listSection.querySelector("#survey-list");
 
+  // 同一次首页停留期间可能先后发起多次列表读取：进入首页时读一次，新建草稿
+  // 成功后再刷新一次。列表只认“开始得最晚”的那次读取——每开始一次新读取
+  // 就递增序号，较早发起但尚未完成的读取再晚返回（成功且有数据、成功但为
+  // 空列表、响应无法解析或网络失败）都一律丢弃，不能把新读取已展示的问卷
+  // 换成旧列表、旧的“还没有问卷记录”空状态或“加载失败”提示。以读取开始
+  // 的先后为准，与响应返回的先后无关；离开本次首页后再由 view 代数检查拦
+  // 截，迟到结果不会更新其他页面或下一次进入的首页。
+  let listRequestSeq = 0;
+
   async function loadSurveys() {
+    const requestView = view;
+    const requestSeq = ++listRequestSeq;
     let data;
     try {
       const resp = await fetch("/api/surveys");
       data = await resp.json();
     } catch (err) {
-      if (view !== activeView) return;
+      if (requestView !== activeView || requestSeq !== listRequestSeq) return;
       listEl.replaceChildren(h("li", {class: "muted"}, "问卷列表加载失败。"));
       return;
     }
-    if (view !== activeView) return;
+    if (requestView !== activeView || requestSeq !== listRequestSeq) return;
     listEl.replaceChildren();
     if (!data.surveys.length) {
       listEl.append(h("li", {class: "muted"}, "还没有问卷记录。"));
