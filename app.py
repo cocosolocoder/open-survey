@@ -604,17 +604,25 @@ function renderHome() {
   );
   const listEl = listSection.querySelector("#survey-list");
 
+  // 同一次首页停留期间的列表读取序号：每次发起新读取（进入首页的首次读取、
+  // 创建成功后的刷新）都递增。只有最新发起的那次读取允许更新列表；较早开始
+  // 的读取即使更晚返回——无论成功、返回空列表还是网络失败——都必须丢弃，
+  // 不能覆盖新读取已经展示的内容，也不能把列表换回旧的空状态或失败提示。
+  // 以哪次读取开始得更晚为准，与返回先后无关。
+  let listLoadSeq = 0;
+
   async function loadSurveys() {
+    const seq = ++listLoadSeq;
     let data;
     try {
       const resp = await fetch("/api/surveys");
       data = await resp.json();
     } catch (err) {
-      if (view !== activeView) return;
+      if (view !== activeView || seq !== listLoadSeq) return;
       listEl.replaceChildren(h("li", {class: "muted"}, "问卷列表加载失败。"));
       return;
     }
-    if (view !== activeView) return;
+    if (view !== activeView || seq !== listLoadSeq) return;
     listEl.replaceChildren();
     if (!data.surveys.length) {
       listEl.append(h("li", {class: "muted"}, "还没有问卷记录。"));
