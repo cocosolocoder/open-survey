@@ -149,13 +149,21 @@ function h(tag, attrs, ...children) {
 /* ---------- 问卷表单（新建 / 编辑共用） ---------- */
 
 function buildSurveyForm(existing, hooks, view) {
-  const mode = existing ? "edit" : "create";
+  // 新建表单首次创建成功且等待期间仍有未保存修改时，会就地转为“编辑刚创建
+  // 的那份草稿”，因此 mode 允许从 create 切换为 edit。
+  let mode = existing ? "edit" : "create";
+
+  // 表单当前正在编辑的草稿编号：编辑模式一开始就有；新建模式只在首次创建
+  // 成功后才拿到。拿到编号之后，这份表单继续保存时一律 PUT 同一编号，不
+  // 能再 POST 出第二份问卷。
+  let surveyId = existing ? existing.id : null;
 
   const banner = h("div", {class: "banner", id: "form-banner"});
   banner.hidden = true;
 
-  // 编辑模式下保存结果的状态条：成功保存与“仍有未保存修改”必须分开展示，
-  // 不能只给一条笼统的“保存成功”。新建模式不使用它（保存成功即进入详情）。
+  // 保存结果的状态条：成功保存与“仍有未保存修改”必须分开展示，不能只给
+  // 一条笼统的“保存成功”。新建模式首次保存成功且等待期间没有新改动时直接
+  // 进入详情（状态条不可见）；等待期间又有改动时则与编辑模式共用本状态条。
   const statusBar = h("div", {class: "save-status", id: "save-status", role: "status"});
   statusBar.hidden = true;
 
@@ -367,38 +375,57 @@ function buildSurveyForm(existing, hooks, view) {
     existing.questions.forEach(question => addQuestion(question.type, question));
     renumber();
     scheduleGrow(titleInput);
+  }
 
-    // 最近一次服务器确认保存的表单内容（点击保存时的快照）。它只用于成功返回
-    // 后判断当前表单相对那次提交有没有新改动；等待期间的输入始终留在表单里，
-    // 不会被它覆盖，也不会被自动补交。
-    let savedState = readDraft();
+  // 最近一次服务器确认保存的表单内容（点击保存时的快照）。新建模式首次保存
+  // 成功前为 null（尚无已保存内容可比）；成功后改记那次提交的快照。它只用
+  // 于成功返回后判断当前表单相对那次提交有没有新改动；等待期间的输入始终留
+  // 在表单里，不会被它覆盖，也不会被自动补交。
+  let savedState = mode === "edit" ? readDraft() : null;
 
-    function refreshDirty() {
-      const dirtyNote = statusBar.querySelector("#save-note-dirty");
-      // 尚未成功保存过（状态条隐藏）时无需提示。
-      if (statusBar.hidden || !dirtyNote) return;
-      // 与点击保存时的整份内容比较：改过又恢复原值即视为无未保存修改。
-      dirtyNote.hidden = sameState(readDraft(), savedState);
+  function refreshDirty() {
+    const dirtyNote = statusBar.querySelector("#save-note-dirty");
+    // 尚未成功保存过（状态条隐藏）时无需提示。
+    if (statusBar.hidden || !dirtyNote) return;
+    // 与点击保存时的整份内容比较：改过又恢复原值即视为无未保存修改。
+    dirtyNote.hidden = sameState(readDraft(), savedState);
+  }
+
+  // 监听表单上全部真实编辑动作（标题/说明/题目标题/选项输入、必填勾选、
+  // 题目与选项增删）。题目卡片是动态增删的，因此在表单上做事件委托。
+  form.addEventListener("input", refreshDirty);
+  form.addEventListener("change", event => {
+    if (event.target.closest && event.target.closest(".q-required")) refreshDirty();
+  });
+  form.addEventListener("click", event => {
+    const actionable = event.target.closest
+      && event.target.closest("button.add-opt, button.link.danger, button.btn.secondary");
+    if (actionable) {
+      // 新增/删除在本次点击处理中完成，延到冒泡后再读取最终 DOM。
+      queueMicrotask(refreshDirty);
     }
+  });
 
-    // 监听编辑页上全部真实编辑动作（标题/说明/题目标题/选项输入、必填勾选、
-    // 题目与选项增删）。题目卡片是动态增删的，因此在表单上做事件委托。
-    form.addEventListener("input", refreshDirty);
-    form.addEventListener("change", event => {
-      if (event.target.closest && event.target.closest(".q-required")) refreshDirty();
-    });
-    form.addEventListener("click", event => {
-      const actionable = event.target.closest
-        && event.target.closest("button.add-opt, button.link.danger, button.btn.secondary");
-      if (actionable) {
-        // 新增/删除在本次点击处理中完成，延到冒泡后再读取最终 DOM。
-        queueMicrotask(refreshDirty);
-      }
-    });
+  hooks = hooks || {};
+  hooks.markSaved = state => { savedState = state; };
+  hooks.isCurrent = state => sameState(readDraft(), state);
 
-    hooks = hooks || {};
-    hooks.markSaved = state => { savedState = state; };
-    hooks.isCurrent = state => sameState(readDraft(), state);
+  // 首次创建成功、但等待期间表单又有未保存修改时：不跳转、不清空，把这份新建
+  // 表单就地切换成“编辑刚创建的那份草稿”。只改标题、说明文字与操作按钮，
+  // 绝不动任何当前输入与题目/选项增删结果及次序。此后 surveyId 已绑定编号，
+  // 再保存走 PUT 同一编号，首页列表与详情也对应这同一个编号。
+  function adoptCreatedDraft(id) {
+    mode = "edit";
+    const heading = form.querySelector("h2");
+    if (heading) {
+      heading.textContent = `编辑问卷草稿 #${id}`;
+      heading.after(h("p", {class: "muted"},
+        "保存将整份替换当前草稿；取消则放弃本次修改，问卷编号和地址不变。"));
+    }
+    submitButton.before(
+      h("a", {class: "btn secondary", href: `#/surveys/${id}`}, "取消"));
+    submitButton.setAttribute("data-label", "保存修改");
+    submitButton.textContent = "保存修改";
   }
 
   async function submitForm(event) {
@@ -482,7 +509,10 @@ function buildSurveyForm(existing, hooks, view) {
     // 是独立对象，等待期间的后续输入不会改变它；成功返回后拿它与重新读取的
     // 当前表单比较——等待期间的任何输入/增删都不属于本次保存。
     const submittedState = draft;
-    const endpoint = mode === "edit" ? `/api/surveys/${existing.id}` : "/api/surveys";
+    // 新建表单在首次创建成功之前没有编号，走 POST；一旦创建成功，这份表单就
+    // 绑定到新编号，此后再保存一律 PUT 同一编号，绝不新增第二份问卷。
+    const creating = surveyId === null;
+    const endpoint = creating ? "/api/surveys" : `/api/surveys/${surveyId}`;
     // 这次保存只属于发起它的那一代表单；响应再晚返回，只要用户已经离开
     // （首页/详情/编辑切换、重新进入同一问卷、浏览器前进后退），其成功或
     // 失败结果都必须静默丢弃，不能跳转、清空或提示到当前页面上。
@@ -490,57 +520,73 @@ function buildSurveyForm(existing, hooks, view) {
     let resp;
     try {
       resp = await fetch(endpoint, {
-        method: mode === "edit" ? "PUT" : "POST",
+        method: creating ? "POST" : "PUT",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify(payload)
       });
     } catch (err) {
       if (submitView !== activeView) return;
-      // 请求未成功：结束等待，保留当前全部输入与增删结果，允许修改后再次保存。
+      // 请求未成功：结束等待，保留当前全部输入与增删结果。新建模式下编号仍未
+      // 拿到（surveyId 保持 null），修改后再次保存会重新 POST 创建，绝不会
+      // 显示成功或跳进某份问卷详情。
       saving = false;
       resetSaveButton();
       hideSaveStatus();
-      showBanner([{el: null, msg: `网络错误，问卷尚未保存：${err}`}]);
+      showBanner([{el: null, msg: creating
+        ? `网络错误，本次创建尚未确认保存：${err}。已填写的内容仍保留在页面上，修改后可重新创建。`
+        : `网络错误，问卷尚未保存：${err}`}]);
       return;
     }
     if (submitView !== activeView) return;
     let data = {};
     try { data = await resp.json(); } catch (_) { /* 保留已输入内容 */ }
     if (submitView !== activeView) return;
-    const saved = mode === "edit" ? resp.status === 200 : resp.status === 201;
+    const saved = creating ? resp.status === 201 : resp.status === 200;
     if (saved && data.id !== undefined) {
-      if (mode === "create") {
-        form.reset();
-        qBox.replaceChildren();
-        autoGrow(titleInput);
+      if (creating) {
+        // 首次创建成功：这份表单从此绑定到刚创建的编号。刷新首页列表，让新
+        // 草稿出现在列表中；列表与详情使用同一个编号。
+        surveyId = data.id;
         if (hooks && hooks.onCreated) hooks.onCreated();
-        location.hash = `#/surveys/${data.id}`;
-        return;
       }
-      // 编辑模式：先把“这次提交的内容”记为已保存（服务器上的草稿正是它）。
+      // 先把“这次提交的内容”记为已保存（服务器上的草稿正是它）。
       if (hooks && hooks.markSaved) hooks.markSaved(submittedState);
       // 比较点击保存前后的整份表单：等待期间改过又恢复原值时结构相同，按
       // 无新改动处理，仍进入详情。
       const stillSame = hooks && hooks.isCurrent ? hooks.isCurrent(submittedState) : true;
       if (stillSame) {
+        if (creating) {
+          // 新建且等待期间没有新改动：沿用原有行为，清空新建表单并进入新问卷
+          // 详情，详情展示的就是服务器实际保存的内容。
+          form.reset();
+          qBox.replaceChildren();
+          autoGrow(titleInput);
+        }
         location.hash = `#/surveys/${data.id}`;
         return;
       }
-      // 等待期间出现了新的修改：留在编辑页，保留当前完整内容与顺序。绿色块
-      // 只确认“刚才提交的内容已保存”，黄色块提示“当前还有未保存的修改”，
-      // 不自动补交，也不撤销已成功的保存。保存恢复可用，再次点击提交的才是
-      // 当前内容，而不是沿用上一笔提交的旧内容。
+      // 等待期间出现了新的修改：不跳转，保留当前完整内容与顺序（题目与选项
+      // 维持页面当前次序，不恢复成提交时的结构）。绿色块只确认“刚才提交的
+      // 内容已保存”，黄色块提示“当前还有未保存的修改”，不自动补交，也不
+      // 撤销已成功的保存。新建表单就此转为编辑刚创建的那份草稿：标题改为
+      // 编辑态、补上“取消”链接、按钮文案改为“保存修改”；再次点击保存时
+      // surveyId 已存在，走 PUT 同一编号，提交的才是当前内容。
+      if (creating) adoptCreatedDraft(data.id);
       saving = false;
       resetSaveButton();
       renderSaveStatus(true);
       return;
     }
     // 服务端未确认保存成功：结束等待，不清空任何输入，展示具体问题；用户修改
-    // 后可再次保存（不会自行重发，也不会一直停在“正在保存”）。
+    // 后可再次保存（不会自行重发，也不会一直停在“正在保存”）。新建模式下
+    // 本次没有创建任何记录（surveyId 仍为 null），再次保存仍是重新创建。
     saving = false;
     resetSaveButton();
     hideSaveStatus();
-    showBanner([{el: null, msg: data.error || `保存失败（HTTP ${resp.status}），问卷未保存，请检查后重试。`}]);
+    showBanner([{el: null, msg: data.error
+      || (creating
+        ? `保存失败（HTTP ${resp.status}），本次创建未确认保存，请检查后重试。`
+        : `保存失败（HTTP ${resp.status}），问卷未保存，请检查后重试。`)}]);
   }
 
   return form;
