@@ -770,12 +770,42 @@ route();
 """
 
 
+def merge_surrogate_pairs(text):
+    """合并 JSON 解码后残留在字符串中的 UTF-16 代理对。
+
+    JSON 里 "😀" 这样的成对转义被 json.loads 解码为两个相邻的
+    代理码点而不是一个字符；这里把它们合并回原本的那个字符，使转义写法与
+    直接发送该字符得到完全相同的文字。发现未配对的代理码点（如单独的
+    \uD800 或 \uDC00）时返回 None：这样的字符串无法编码保存，调用方应把
+    它作为该字段的内容错误拒绝，而不是让它进入保存过程。
+    """
+    if not any(0xD800 <= ord(char) <= 0xDFFF for char in text):
+        return text
+    chars = []
+    index = 0
+    while index < len(text):
+        code = ord(text[index])
+        if 0xD800 <= code <= 0xDBFF and index + 1 < len(text):
+            low = ord(text[index + 1])
+            if 0xDC00 <= low <= 0xDFFF:
+                chars.append(chr(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)))
+                index += 2
+                continue
+        if 0xD800 <= code <= 0xDFFF:
+            return None
+        chars.append(text[index])
+        index += 1
+    return "".join(chars)
+
+
 def validate_survey(obj):
     """Validate a decoded survey payload.
 
     Returns (clean_survey, None) on success or (None, error_message) on failure.
     Strings are stored trimmed of surrounding whitespace; description keeps its
-    raw value so Chinese, quotes and newlines are preserved.
+    raw value so Chinese, quotes and newlines are preserved. Unpaired Unicode
+    surrogate codepoints are rejected per field with a 400-level message that
+    names the exact field/question/option, before anything is saved.
     """
     if not isinstance(obj, dict):
         return None, "请求体必须是 JSON 对象"
@@ -784,6 +814,9 @@ def validate_survey(obj):
     title = obj["title"]
     if not isinstance(title, str):
         return None, "title 必须是字符串"
+    title = merge_surrogate_pairs(title)
+    if title is None:
+        return None, "title 包含无法保存的字符（存在未配对的 Unicode 代理码点）"
     title = title.strip()
     if not title:
         return None, "title 不能为空（或全为空白字符）"
@@ -791,6 +824,9 @@ def validate_survey(obj):
     description = obj.get("description", "")
     if not isinstance(description, str):
         return None, "description 必须是字符串"
+    description = merge_surrogate_pairs(description)
+    if description is None:
+        return None, "description 包含无法保存的字符（存在未配对的 Unicode 代理码点）"
 
     if "questions" not in obj:
         return None, "缺少字段 questions"
@@ -812,7 +848,9 @@ def validate_survey(obj):
         if not isinstance(question_type, str):
             return None, f"{location}：type 必须是字符串"
         if question_type not in QUESTION_TYPES:
-            shown = json.dumps(question_type, ensure_ascii=False)
+            # 题型名称本身可能含有未配对的代理码点：用 ensure_ascii 转义后再
+            # 放进错误信息，保证这条 400 响应自身永远可以正常编码发出。
+            shown = json.dumps(question_type, ensure_ascii=True)
             return None, f"{location}：不支持的题型 {shown}（仅支持 text 或 single_choice）"
 
         if "title" not in raw_question:
@@ -820,6 +858,9 @@ def validate_survey(obj):
         question_title = raw_question["title"]
         if not isinstance(question_title, str):
             return None, f"{location}：title 必须是字符串"
+        question_title = merge_surrogate_pairs(question_title)
+        if question_title is None:
+            return None, f"{location}：题目标题包含无法保存的字符（存在未配对的 Unicode 代理码点）"
         question_title = question_title.strip()
         if not question_title:
             return None, f"{location}：题目标题不能为空（或全为空白字符）"
@@ -843,7 +884,11 @@ def validate_survey(obj):
             for option_index, raw_option in enumerate(raw_options, start=1):
                 if not isinstance(raw_option, str):
                     return None, f"{location}：第 {option_index} 个选项必须是字符串"
-                option = raw_option.strip()
+                option = merge_surrogate_pairs(raw_option)
+                if option is None:
+                    return None, (f"{location}：第 {option_index} 个选项包含无法保存的字符"
+                                  "（存在未配对的 Unicode 代理码点）")
+                option = option.strip()
                 if not option:
                     return None, f"{location}：第 {option_index} 个选项不能为空（或全为空白字符）"
                 if option in seen:
