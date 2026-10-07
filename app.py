@@ -759,20 +759,62 @@ async function renderDetail(id) {
 
 /* ---------- 编辑草稿 ---------- */
 
-function showEditLoadError(id, message, view) {
-  // 加载失败时明确提示，绝不能用空白编辑表单覆盖已有内容
+function showEditLoadError(id, message, view, options) {
+  // 加载失败时明确提示，绝不能用空白编辑表单覆盖已有内容。失败分两类：
+  // - 传输层失败（网络错误、非成功状态、404）：沿用各自的现有说明；
+  // - 200 已到达但正文无法用于编辑：标题直接点明“返回内容无法用于编辑”。
+  // 两类都停留在当前编辑地址，只给重试 / 返回详情 / 返回首页入口，不渲染
+  // 任何输入框、题目操作或保存按钮。
   if (view !== activeView) return;
+  const unusable = !!(options && options.unusable);
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
     h("h2", null, `编辑问卷草稿 #${id}`),
     h("div", {class: "banner", role: "alert"},
-      h("strong", null, "问卷内容加载失败，未打开编辑表单："),
-      h("p", {class: "detail-meta", style: "margin:.4rem 0 0"}, message),
+      unusable
+        ? h("strong", null, "问卷内容加载失败，返回内容无法用于编辑。")
+        : h("strong", null, "问卷内容加载失败，未打开编辑表单："),
+      message ? h("p", {class: "detail-meta", style: "margin:.4rem 0 0"}, message) : null,
       h("p", {style: "margin:.6rem 0 0"},
+        // 重试仍读取当前地址对应的同一份问卷，并重新显示加载提示。
         h("button", {type: "button", class: "btn secondary", onclick: () => renderEdit(id)}, "重试"), " ",
-        h("a", {class: "btn secondary", href: `#/surveys/${id}`}, "返回详情"))
+        h("a", {class: "btn secondary", href: `#/surveys/${id}`}, "返回详情"), " ",
+        h("a", {class: "btn secondary", href: "#/"}, "返回首页"))
     )
   );
+}
+
+// 编辑页读到 200 后放行表单的唯一门槛：正文必须是属于“当前地址这份问卷”
+// 的、能逐字段完整展示并再次保存的问卷对象。HTTP 200 只代表传输成功——
+// 正文为 null/数组等非对象、编号缺失或与地址不一致、标题或说明不是字符串、
+// 题目不是数组，或任一题目混入无法编辑的内容（题目标题非字符串、题型不受
+// 支持、required 不是布尔值、options 不是数组、选项不是字符串、单选题少于
+// 两个选项、文本题携带非空选项），都无法安全地呈现原稿：放过去只会得到
+// 空白新建表单（后续保存会 POST 出新问卷）或直接脚本报错永久停在加载态。
+// 因此这里整份判为不可用，由调用方显示加载失败，绝不补默认值、绝不只跳过
+// 异常题目，也绝不能把 1/"true" 之类的错误必填值用 !! 转成勾选状态。
+// 这里不做保存期校验（空白裁剪、空标题、重复选项等仍留给保存流程）：读取
+// 只确认原稿完整可展示。旧记录的合法形态——说明为空字符串、题目为空数组
+// ——照常放行，可进入编辑补齐。
+function editableSurveyFromRead(data, expectedId) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  if (data.id !== expectedId) return null;
+  if (typeof data.title !== "string") return null;
+  if (typeof data.description !== "string") return null;
+  if (!Array.isArray(data.questions)) return null;
+  for (const question of data.questions) {
+    if (!question || typeof question !== "object" || Array.isArray(question)) return null;
+    if (typeof question.title !== "string") return null;
+    if (question.type !== "text" && question.type !== "single_choice") return null;
+    if (typeof question.required !== "boolean") return null;
+    if (!Array.isArray(question.options)) return null;
+    for (const option of question.options) {
+      if (typeof option !== "string") return null;
+    }
+    if (question.type === "single_choice" && question.options.length < 2) return null;
+    if (question.type === "text" && question.options.length !== 0) return null;
+  }
+  return data;
 }
 
 async function renderEdit(id) {
@@ -782,25 +824,44 @@ async function renderEdit(id) {
     h("p", {class: "muted", id: "edit-status"}, "加载中…")
   );
 
-  let survey;
+  // 阶段一：只等响应对象。网络失败沿用现有提示，且不改动任何已保存内容。
+  let resp;
   try {
-    const resp = await fetch(`/api/surveys/${id}`);
-    if (view !== activeView) return;
-    if (resp.status === 404) {
-      showEditLoadError(id, `问卷 #${id} 不存在。`, view);
-      return;
-    }
-    if (!resp.ok) {
-      showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`, view);
-      return;
-    }
-    survey = await resp.json();
+    resp = await fetch(`/api/surveys/${id}`);
   } catch (err) {
     showEditLoadError(id, `网络错误：${err}。已保存的问卷内容未受影响，可重试加载。`, view);
     return;
   }
-
   if (view !== activeView) return;
+
+  // 阶段二：404 与其它非成功状态沿用现有提示。
+  if (resp.status === 404) {
+    showEditLoadError(id, `问卷 #${id} 不存在。`, view);
+    return;
+  }
+  if (!resp.ok) {
+    showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`, view);
+    return;
+  }
+
+  // 阶段三：200 的正文仍可能无法使用。JSON 解析失败与结构不可用同样按
+  // “返回内容无法用于编辑”处理：留在当前编辑地址显示失败提示，不允许
+  // 退回空白新建表单，也不会永久停在加载提示。
+  let data;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    showEditLoadError(id, null, view, {unusable: true});
+    return;
+  }
+  if (view !== activeView) return;
+  const survey = editableSurveyFromRead(data, id);
+  if (survey === null) {
+    showEditLoadError(id, null, view, {unusable: true});
+    return;
+  }
+
+  // 阶段四：只有读到属于当前问卷、能完整展示原稿的内容，才开放编辑。
   app.replaceChildren(
     h("p", null, h("a", {href: `#/surveys/${id}`}, "← 返回问卷详情")),
     buildSurveyForm(survey, {}, view)
