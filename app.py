@@ -622,23 +622,58 @@ function renderHome() {
 
   // 同一次首页停留期间的列表读取序号：每次发起新读取（进入首页的首次读取、
   // 创建成功后的刷新）都递增。只有最新发起的那次读取允许更新列表；较早开始
-  // 的读取即使更晚返回——无论成功、返回空列表还是网络失败——都必须丢弃，
-  // 不能覆盖新读取已经展示的内容，也不能把列表换回旧的空状态或失败提示。
-  // 以哪次读取开始得更晚为准，与返回先后无关。
+  // 的读取即使更晚返回——无论成功、返回空列表、服务端错误、正文无法使用
+  // 还是网络失败——都必须丢弃，不能覆盖新读取已经展示的内容，也不能把列表
+  // 换回旧的空状态或失败提示。以哪次读取开始得更晚为准，与返回先后无关。
   let listLoadSeq = 0;
+
+  // 失败或提示都只放一条 <li> 并整体替换列表：失败时列表区域不能只剩空白、
+  // 一直停在“加载中…”，也不能留下上一次读取的记录被误认为本次读取成功。
+  function showListMessage(text) {
+    listEl.replaceChildren(h("li", {class: "muted"}, text));
+  }
 
   async function loadSurveys() {
     const seq = ++listLoadSeq;
-    let data;
+    // 阶段一：只等响应对象。网络中断（fetch reject）时没有 HTTP 状态码，
+    // 继续沿用现有的网络失败提示。
+    let resp;
     try {
-      const resp = await fetch("/api/surveys");
-      data = await resp.json();
+      resp = await fetch("/api/surveys");
     } catch (err) {
       if (view !== activeView || seq !== listLoadSeq) return;
-      listEl.replaceChildren(h("li", {class: "muted"}, "问卷列表加载失败。"));
+      showListMessage("问卷列表加载失败。");
       return;
     }
     if (view !== activeView || seq !== listLoadSeq) return;
+
+    // 阶段二：非成功状态一律按失败处理，提示中注明实际 HTTP 状态码。无论
+    // 正文是错误 JSON、普通文字、空内容，还是恰好带有 surveys 数组，都不
+    // 能当成成功结果，也不能据此告诉用户“没有问卷”。
+    if (!resp.ok) {
+      showListMessage(`问卷列表加载失败（HTTP ${resp.status}）。`);
+      return;
+    }
+
+    // 阶段三：成功状态也必须拿到符合现有格式的正文。正文不能解析为 JSON、
+    // 缺少 surveys 或 surveys 不是数组时，返回内容无法作为问卷列表使用，
+    // 同样按加载失败处理——绝不能回退成“还没有问卷记录”。
+    let data;
+    try {
+      data = await resp.json();
+    } catch (err) {
+      if (view !== activeView || seq !== listLoadSeq) return;
+      showListMessage("问卷列表加载失败：返回内容无法作为问卷列表使用。");
+      return;
+    }
+    if (view !== activeView || seq !== listLoadSeq) return;
+    if (!data || typeof data !== "object" || !Array.isArray(data.surveys)) {
+      showListMessage("问卷列表加载失败：返回内容无法作为问卷列表使用。");
+      return;
+    }
+
+    // 阶段四：只有成功取得符合格式的问卷列表，才能展示记录或空列表提示。
+    // 先整体替换，清掉“加载中…”以及上一次读取（成功或失败）留下的内容。
     listEl.replaceChildren();
     if (!data.surveys.length) {
       listEl.append(h("li", {class: "muted"}, "还没有问卷记录。"));
