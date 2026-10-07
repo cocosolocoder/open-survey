@@ -759,20 +759,82 @@ async function renderDetail(id) {
 
 /* ---------- 编辑草稿 ---------- */
 
-function showEditLoadError(id, message, view) {
-  // 加载失败时明确提示，绝不能用空白编辑表单覆盖已有内容
+function showEditLoadError(id, message, view, heading) {
+  // 加载失败时明确提示，绝不能用空白编辑表单覆盖已有内容，也不能把无法使用
+  // 的读取结果补成一份空白草稿。
   if (view !== activeView) return;
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
     h("h2", null, `编辑问卷草稿 #${id}`),
     h("div", {class: "banner", role: "alert"},
-      h("strong", null, "问卷内容加载失败，未打开编辑表单："),
+      h("strong", null, heading || "问卷内容加载失败，未打开编辑表单："),
       h("p", {class: "detail-meta", style: "margin:.4rem 0 0"}, message),
       h("p", {style: "margin:.6rem 0 0"},
         h("button", {type: "button", class: "btn secondary", onclick: () => renderEdit(id)}, "重试"), " ",
-        h("a", {class: "btn secondary", href: `#/surveys/${id}`}, "返回详情"))
+        h("a", {class: "btn secondary", href: `#/surveys/${id}`}, "返回详情"), " ",
+        h("a", {class: "btn secondary", href: "#/"}, "返回首页"))
     )
   );
+}
+
+// 编辑页只接受“属于当前问卷、能完整展示原稿”的读取结果。即使响应是成功
+// 状态（HTTP 200），只要任何一项不满足，整份结果都不能用于编辑——绝不允许
+// 把缺失字段补成空白标题/空题目数组、把错误的必填值转成勾选状态，或只丢弃
+// 其中异常的题目。旧记录的合法形态（说明为空字符串、题目为空数组）照常放行。
+// 返回 null 表示可用；否则返回一句面向用户的失败说明。
+function validateEditSurvey(survey, id) {
+  if (survey === null || typeof survey !== "object" || Array.isArray(survey)) {
+    return "返回内容不是问卷对象。";
+  }
+  // 编号缺失或与地址中的编号不一致：不能把别的问卷（或没有编号的内容）
+  // 当成这份草稿打开，否则后续保存会改错记录。
+  if (survey.id === undefined || survey.id === null) {
+    return "返回内容缺少问卷编号。";
+  }
+  if (Number(survey.id) !== Number(id)) {
+    return `返回内容的问卷编号（${survey.id}）与当前编辑地址（#${id}）不一致。`;
+  }
+  if (typeof survey.title !== "string") {
+    return "返回内容缺少可用的问卷标题。";
+  }
+  if (typeof survey.description !== "string") {
+    return "返回内容缺少可用的问卷说明。";
+  }
+  if (!Array.isArray(survey.questions)) {
+    return "返回内容缺少可用的题目数组。";
+  }
+  for (let i = 0; i < survey.questions.length; i++) {
+    const location = `第 ${i + 1} 题`;
+    const question = survey.questions[i];
+    if (question === null || typeof question !== "object" || Array.isArray(question)) {
+      return `${location}不是可编辑的题目对象。`;
+    }
+    if (typeof question.title !== "string") {
+      return `${location}缺少可用的题目标题。`;
+    }
+    // 题型必须是当前表单支持的两种；未知题型没有对应的编辑界面，不能混入。
+    if (question.type !== "text" && question.type !== "single_choice") {
+      return `${location}的题型不受支持。`;
+    }
+    // 必填必须是真正的布尔值：不能把缺失、null、0/1 或字符串一律转成勾选状态。
+    if (typeof question.required !== "boolean") {
+      return `${location}的必填设置不是布尔值。`;
+    }
+    if (!Array.isArray(question.options)) {
+      return `${location}缺少可用的选项数组。`;
+    }
+    if (question.options.some(option => typeof option !== "string")) {
+      return `${location}的选项内容必须全部是字符串。`;
+    }
+    if (question.type === "single_choice" && question.options.length < 2) {
+      return `${location}是单选题但选项少于两个，无法编辑。`;
+    }
+    // 文本题携带非空选项同样无法用现有表单正确表达，按读取失败处理。
+    if (question.type === "text" && question.options.length > 0) {
+      return `${location}是文本题却携带了选项，无法编辑。`;
+    }
+  }
+  return null;
 }
 
 async function renderEdit(id) {
@@ -782,25 +844,49 @@ async function renderEdit(id) {
     h("p", {class: "muted", id: "edit-status"}, "加载中…")
   );
 
-  let survey;
+  // 无论首次进入还是点击“重试”，都只读取当前地址对应的问卷编号，并先显示
+  // 加载提示。读取本身是 GET，不会改动服务器上的草稿或问卷列表。
+  let resp;
   try {
-    const resp = await fetch(`/api/surveys/${id}`);
-    if (view !== activeView) return;
-    if (resp.status === 404) {
-      showEditLoadError(id, `问卷 #${id} 不存在。`, view);
-      return;
-    }
-    if (!resp.ok) {
-      showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`, view);
-      return;
-    }
-    survey = await resp.json();
+    resp = await fetch(`/api/surveys/${id}`);
   } catch (err) {
+    if (view !== activeView) return;
     showEditLoadError(id, `网络错误：${err}。已保存的问卷内容未受影响，可重试加载。`, view);
     return;
   }
-
   if (view !== activeView) return;
+  if (resp.status === 404) {
+    showEditLoadError(id, `问卷 #${id} 不存在。`, view);
+    return;
+  }
+  if (!resp.ok) {
+    showEditLoadError(id, `服务端返回异常（HTTP ${resp.status}），请稍后重试。`, view);
+    return;
+  }
+
+  // 即使是成功状态，正文无法解析为 JSON 时同样不能进入编辑——既不能停在
+  // “加载中…”，也不能退化成一份空白新建表单。
+  let survey;
+  try {
+    survey = await resp.json();
+  } catch (err) {
+    if (view !== activeView) return;
+    showEditLoadError(id, "返回内容无法用于编辑：响应不是合法的 JSON。", view,
+      "问卷内容加载失败，返回内容无法用于编辑");
+    return;
+  }
+  if (view !== activeView) return;
+
+  // 只有读到属于当前问卷、能完整展示原稿的内容才开放编辑。任何结构问题都
+  // 整份判失败：停留在当前编辑地址，给出重试/返回详情/返回首页，不显示输入
+  // 框、添加题目或保存按钮，也不新建任何记录。
+  const contentError = validateEditSurvey(survey, id);
+  if (contentError !== null) {
+    showEditLoadError(id, `返回内容无法用于编辑：${contentError}`, view,
+      "问卷内容加载失败，返回内容无法用于编辑");
+    return;
+  }
+
   app.replaceChildren(
     h("p", null, h("a", {href: `#/surveys/${id}`}, "← 返回问卷详情")),
     buildSurveyForm(survey, {}, view)
