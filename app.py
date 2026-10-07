@@ -627,18 +627,40 @@ function renderHome() {
   // 以哪次读取开始得更晚为准，与返回先后无关。
   let listLoadSeq = 0;
 
+  // 列表区域只渲染“本次最新读取确认成功”的结果：HTTP 成功且正文是可解析的
+  // JSON、其中 surveys 是数组。其余任何情况——非成功状态（无论正文是错误
+  // JSON、普通文字、空内容还是恰好带着 surveys 数组）、成功但正文无法解析、
+  // surveys 缺失或不是数组——都结束加载并显示加载失败提示，绝不能按空列表或
+  // 记录展示，也不能留下可被误认为本次读取成功的旧内容。
   async function loadSurveys() {
     const seq = ++listLoadSeq;
-    let data;
+    let resp;
     try {
-      const resp = await fetch("/api/surveys");
-      data = await resp.json();
+      resp = await fetch("/api/surveys");
     } catch (err) {
       if (view !== activeView || seq !== listLoadSeq) return;
+      // 网络中断：请求根本没有拿到服务端响应。
       listEl.replaceChildren(h("li", {class: "muted"}, "问卷列表加载失败。"));
       return;
     }
     if (view !== activeView || seq !== listLoadSeq) return;
+    // 服务端返回非成功状态：无论正文内容是什么（包括恰好带有 surveys 数组），
+    // 都不能当成问卷列表，必须注明实际状态码。
+    if (!resp.ok) {
+      listEl.replaceChildren(h("li", {class: "muted"},
+        `问卷列表加载失败（HTTP ${resp.status}）。`));
+      return;
+    }
+    let data = null;
+    try { data = await resp.json(); } catch (_) { data = null; }
+    if (view !== activeView || seq !== listLoadSeq) return;
+    // 成功状态但正文不是可解析的 JSON，或 surveys 缺失/不是数组：返回内容
+    // 无法作为问卷列表使用，同样按加载失败处理，而不是猜成“没有问卷”。
+    if (!data || !Array.isArray(data.surveys)) {
+      listEl.replaceChildren(h("li", {class: "muted"},
+        "问卷列表加载失败：返回内容无法作为问卷列表使用。"));
+      return;
+    }
     listEl.replaceChildren();
     if (!data.surveys.length) {
       listEl.append(h("li", {class: "muted"}, "还没有问卷记录。"));
