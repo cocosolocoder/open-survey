@@ -702,19 +702,11 @@ async function renderDetail(id) {
   );
   const status = document.getElementById("detail-status");
 
-  let survey;
+  // 阶段一：只等响应对象。网络中断（fetch reject）没有 HTTP 状态码，沿用
+  // 现有的网络失败提示——不能当成“没有题目”，更不能说成“问卷不存在”。
+  let resp;
   try {
-    const resp = await fetch(`/api/surveys/${id}`);
-    if (view !== activeView) return;
-    if (resp.status === 404) {
-      status.textContent = `问卷 #${id} 不存在。`;
-      return;
-    }
-    if (!resp.ok) {
-      status.textContent = `详情加载失败（HTTP ${resp.status}），请稍后重试。`;
-      return;
-    }
-    survey = await resp.json();
+    resp = await fetch(`/api/surveys/${id}`);
   } catch (err) {
     if (view !== activeView) return;
     status.textContent = `详情加载失败：${err}`;
@@ -722,6 +714,41 @@ async function renderDetail(id) {
   }
   if (view !== activeView) return;
 
+  // 阶段二：只有真实收到 404 才说问卷不存在；其它非成功状态沿用现有提示。
+  if (resp.status === 404) {
+    status.textContent = `问卷 #${id} 不存在。`;
+    return;
+  }
+  if (!resp.ok) {
+    status.textContent = `详情加载失败（HTTP ${resp.status}），请稍后重试。`;
+    return;
+  }
+
+  // 阶段三：200 只代表传输成功。正文无法解析为 JSON 时，无法用于展示，按
+  // 加载失败处理；不能让解析异常冒出函数把页面永久留在“加载中…”。
+  let data;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    if (view !== activeView) return;
+    status.textContent = "详情加载失败，返回内容无法用于展示。";
+    return;
+  }
+  if (view !== activeView) return;
+
+  // 阶段四：解析成功也必须是属于当前地址编号、能完整展示的单份问卷对象。
+  // 编号不一致、标题/说明不是字符串、题目不是数组，或任一题目缺少字符串
+  // 标题、题型不受支持、必填不是布尔、选项不是字符串数组、单选题少于两个
+  // 选项、文本题带有选项，都整份判为不可用：不跳过异常题目、不把异常值
+  // 转成默认内容、不把不支持的题型标成文本题，也绝不渲染任何残缺说明、
+  // 题目或编辑入口。这里不做保存期的空白/重复选项校验。
+  const survey = surveyFromRead(data, id);
+  if (survey === null) {
+    status.textContent = "详情加载失败，返回内容无法用于展示。";
+    return;
+  }
+
+  // 阶段五：只有读到能如实展示的整份问卷，才渲染标题、说明、题目与编辑入口。
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
     h("h2", null, `#${survey.id} ${survey.title}`),
@@ -736,6 +763,7 @@ async function renderDetail(id) {
     h("h3", null, `题目（共 ${survey.questions.length} 道）`)
   );
   if (!survey.questions.length) {
+    // 题目为空数组的合法旧记录：显示零道题，并保留进入编辑补齐的入口。
     app.append(
       h("p", {class: "muted"}, "该问卷草稿还没有题目，可进入编辑补齐。"),
       h("p", null, h("a", {class: "btn", href: `#/surveys/${survey.id}/edit`}, "编辑草稿并添加题目"))
@@ -750,7 +778,8 @@ async function renderDetail(id) {
         " ",
         h("span", {class: "tag" + (q.required ? " required" : "")}, q.required ? "必填" : "选填")
       ),
-      q.options && q.options.length
+      // 经过结构校验：只有单选题带选项（至少两个），文本题选项恒为空数组。
+      q.options.length
         ? h("ol", {start: "1"}, q.options.map(opt => h("li", {class: "opt-text-display"}, opt)))
         : null
     )))
@@ -784,19 +813,20 @@ function showEditLoadError(id, message, view, options) {
   );
 }
 
-// 编辑页读到 200 后放行表单的唯一门槛：正文必须是属于“当前地址这份问卷”
-// 的、能逐字段完整展示并再次保存的问卷对象。HTTP 200 只代表传输成功——
+// 详情页与编辑页读到 200 后放行的唯一门槛：正文必须是属于“当前地址这份问卷”
+// 的、能逐字段完整展示的问卷对象。HTTP 200 只代表传输成功——
 // 正文为 null/数组等非对象、编号缺失或与地址不一致、标题或说明不是字符串、
-// 题目不是数组，或任一题目混入无法编辑的内容（题目标题非字符串、题型不受
+// 题目不是数组，或任一题目混入无法展示的内容（题目标题非字符串、题型不受
 // 支持、required 不是布尔值、options 不是数组、选项不是字符串、单选题少于
-// 两个选项、文本题携带非空选项），都无法安全地呈现原稿：放过去只会得到
-// 空白新建表单（后续保存会 POST 出新问卷）或直接脚本报错永久停在加载态。
+// 两个选项、文本题携带非空选项），都无法安全地呈现原稿：放过去只会渲染出
+// 半份详情（甚至把不支持的题型按“其它题型=文本题”标错、直接脚本报错永久
+// 停在加载态），或得到一张空白新建表单（后续保存会 POST 出新问卷）。
 // 因此这里整份判为不可用，由调用方显示加载失败，绝不补默认值、绝不只跳过
 // 异常题目，也绝不能把 1/"true" 之类的错误必填值用 !! 转成勾选状态。
 // 这里不做保存期校验（空白裁剪、空标题、重复选项等仍留给保存流程）：读取
 // 只确认原稿完整可展示。旧记录的合法形态——说明为空字符串、题目为空数组
-// ——照常放行，可进入编辑补齐。
-function editableSurveyFromRead(data, expectedId) {
+// ——照常放行：详情显示零道题与编辑入口，编辑页可进入补齐。
+function surveyFromRead(data, expectedId) {
   if (!data || typeof data !== "object" || Array.isArray(data)) return null;
   if (data.id !== expectedId) return null;
   if (typeof data.title !== "string") return null;
@@ -855,7 +885,7 @@ async function renderEdit(id) {
     return;
   }
   if (view !== activeView) return;
-  const survey = editableSurveyFromRead(data, id);
+  const survey = surveyFromRead(data, id);
   if (survey === null) {
     showEditLoadError(id, null, view, {unusable: true});
     return;
