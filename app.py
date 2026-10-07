@@ -702,19 +702,23 @@ async function renderDetail(id) {
   );
   const status = document.getElementById("detail-status");
 
-  let survey;
-  try {
-    const resp = await fetch(`/api/surveys/${id}`);
+  // 200 已到达但正文无法用于展示时的唯一呈现：留在当前详情地址，只保留返回
+  // 首页入口与一条明确失败提示。任何残缺的标题、说明、题目和“编辑草稿”链接
+  // 都不能出现，也不能把读取失败解释成“没有题目”或“问卷不存在”。
+  function showUnusable() {
     if (view !== activeView) return;
-    if (resp.status === 404) {
-      status.textContent = `问卷 #${id} 不存在。`;
-      return;
-    }
-    if (!resp.ok) {
-      status.textContent = `详情加载失败（HTTP ${resp.status}），请稍后重试。`;
-      return;
-    }
-    survey = await resp.json();
+    app.replaceChildren(
+      h("p", null, h("a", {href: "#/"}, "← 返回首页")),
+      h("div", {class: "banner", role: "alert"},
+        h("strong", null, "详情加载失败，返回内容无法用于展示。"))
+    );
+  }
+
+  // 阶段一：只等响应对象。网络中断（fetch reject）时没有 HTTP 状态码，
+  // 继续沿用现有的网络失败提示。
+  let resp;
+  try {
+    resp = await fetch(`/api/surveys/${id}`);
   } catch (err) {
     if (view !== activeView) return;
     status.textContent = `详情加载失败：${err}`;
@@ -722,6 +726,39 @@ async function renderDetail(id) {
   }
   if (view !== activeView) return;
 
+  // 阶段二：只有实际收到 404 才表示问卷不存在；网络错误与其它失败状态继续
+  // 使用各自现有的失败提示，不能改写成“不存在”或“没有题目”。
+  if (resp.status === 404) {
+    status.textContent = `问卷 #${id} 不存在。`;
+    return;
+  }
+  if (!resp.ok) {
+    status.textContent = `详情加载失败（HTTP ${resp.status}），请稍后重试。`;
+    return;
+  }
+
+  // 阶段三：成功状态只代表传输成功。正文不能解析为 JSON，或虽能解析却不是
+  // “属于当前地址编号、能完整展示”的问卷对象时，整份按加载失败处理，留在
+  // 当前详情地址：不跳过结构有问题的题目、不把异常值转成默认内容、不渲染
+  // 标题说明题目之外的任何编辑入口，也不会一直停在“加载中…”。
+  let data;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    showUnusable();
+    return;
+  }
+  if (view !== activeView) return;
+  const survey = usableSurveyFromRead(data, id);
+  if (survey === null) {
+    showUnusable();
+    return;
+  }
+
+  // 阶段四：只有读到属于当前编号、结构完整的问卷，才展示标题、说明、题目
+  // 与“编辑草稿”入口。说明、标题和选项中的中文、引号与换行按接口原内容
+  // 显示；必填/选填标签对应保存的布尔值；题目为空数组的合法旧记录仍显示
+  // 零道题和进入编辑补齐的入口，说明为空字符串仍显示“（无说明）”。
   app.replaceChildren(
     h("p", null, h("a", {href: "#/"}, "← 返回首页")),
     h("h2", null, `#${survey.id} ${survey.title}`),
@@ -784,19 +821,20 @@ function showEditLoadError(id, message, view, options) {
   );
 }
 
-// 编辑页读到 200 后放行表单的唯一门槛：正文必须是属于“当前地址这份问卷”
-// 的、能逐字段完整展示并再次保存的问卷对象。HTTP 200 只代表传输成功——
-// 正文为 null/数组等非对象、编号缺失或与地址不一致、标题或说明不是字符串、
-// 题目不是数组，或任一题目混入无法编辑的内容（题目标题非字符串、题型不受
-// 支持、required 不是布尔值、options 不是数组、选项不是字符串、单选题少于
-// 两个选项、文本题携带非空选项），都无法安全地呈现原稿：放过去只会得到
-// 空白新建表单（后续保存会 POST 出新问卷）或直接脚本报错永久停在加载态。
-// 因此这里整份判为不可用，由调用方显示加载失败，绝不补默认值、绝不只跳过
-// 异常题目，也绝不能把 1/"true" 之类的错误必填值用 !! 转成勾选状态。
+// 详情页与编辑页读到 200 后放行的唯一门槛：正文必须是属于“当前地址这份
+// 问卷”的、能逐字段完整展示的问卷对象。HTTP 200 只代表传输成功——正文为
+// null/数组等非对象、编号缺失或与地址不一致、标题或说明不是字符串、题目
+// 不是数组，或任一题目混入无法展示的内容（题目标题非字符串、题型不受支持、
+// required 不是布尔值、options 不是数组、选项不是字符串、单选题少于两个
+// 选项、文本题携带非空选项），都无法如实呈现整份问卷：放过去只会得到半份
+// 详情（缺题少项、未知题型被标成文本题）、空白编辑表单（后续保存会 POST
+// 出新问卷）或直接脚本报错永久停在加载态。因此这里整份判为不可用，由调用
+// 方显示加载失败，绝不补默认值、绝不只跳过异常题目，也绝不能把 1/"true"
+// 之类的错误必填值用 !! 转成勾选状态。
 // 这里不做保存期校验（空白裁剪、空标题、重复选项等仍留给保存流程）：读取
-// 只确认原稿完整可展示。旧记录的合法形态——说明为空字符串、题目为空数组
-// ——照常放行，可进入编辑补齐。
-function editableSurveyFromRead(data, expectedId) {
+// 只确认内容完整可展示。旧记录的合法形态——说明为空字符串、题目为空数组
+// ——照常放行，仍显示零道题并可进入编辑补齐。
+function usableSurveyFromRead(data, expectedId) {
   if (!data || typeof data !== "object" || Array.isArray(data)) return null;
   if (data.id !== expectedId) return null;
   if (typeof data.title !== "string") return null;
@@ -855,7 +893,7 @@ async function renderEdit(id) {
     return;
   }
   if (view !== activeView) return;
-  const survey = editableSurveyFromRead(data, id);
+  const survey = usableSurveyFromRead(data, id);
   if (survey === null) {
     showEditLoadError(id, null, view, {unusable: true});
     return;
